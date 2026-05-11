@@ -1,0 +1,31 @@
+From 16afc92daab3a570559cdc781c39cc1e94fa0f20 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Sun, 10 May 2026 20:20:07 -0300
+Subject: [PATCH 1/7] drm/msm/dpu: workaround res re-assignment issues by
+ pairing enc/crtc
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+index da3556eb6ecc..79915bfb470e 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_kms.c
+@@ -879,9 +879,11 @@ static int _dpu_kms_drm_obj_init(struct dpu_kms *dpu_kms)
+ 		}
+ 	}
+ 
+-	/* All CRTCs are compatible with all encoders */
++	/* All CRTCs are compatible with all encoders,
++	 * Nevertheless have enc/crtc paired up for better resource re-assignment in dpu_rm */
++	num_encoders = 0;
+ 	drm_for_each_encoder(encoder, dev)
+-		encoder->possible_crtcs = (1 << dev->mode_config.num_crtc) - 1;
++		encoder->possible_crtcs = 1 << num_encoders++;
+ 
+ 	return 0;
+ }
+-- 
+2.55.0
+
