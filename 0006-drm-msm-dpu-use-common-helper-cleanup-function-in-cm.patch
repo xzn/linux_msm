@@ -1,0 +1,55 @@
+From c4d3a915c4be54ba6749968020c2ba9425d0d01f Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Sun, 10 May 2026 21:23:04 -0300
+Subject: [PATCH 6/7] drm/msm/dpu: use common helper cleanup function in cmd
+ mode disable
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c          |  2 +-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c | 10 +---------
+ 2 files changed, 2 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index f0f92a875ee2..2756c5702f34 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -2345,7 +2345,7 @@ void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
+ 		dpu_enc->dsc = NULL;
+ 	}
+ 
+-	intf_cfg.stream_sel = 0; /* Don't care value for video mode */
++	intf_cfg.stream_sel = 0; /* Ignored by reset_intf_cfg */
+ 	intf_cfg.mode_3d = dpu_encoder_helper_get_3d_blend_mode(phys_enc);
+ 	intf_cfg.dsc = dpu_encoder_helper_get_dsc(phys_enc);
+ 	intf_cfg.cwb = dpu_enc->cwb_mask;
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+index 45079ee59cf6..111f9dd5e053 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+@@ -538,7 +538,6 @@ static void dpu_encoder_phys_cmd_disable(struct dpu_encoder_phys *phys_enc)
+ {
+ 	struct dpu_encoder_phys_cmd *cmd_enc =
+ 		to_dpu_encoder_phys_cmd(phys_enc);
+-	struct dpu_hw_ctl *ctl;
+ 
+ 	if (phys_enc->enable_state == DPU_ENC_DISABLED) {
+ 		DPU_ERROR_CMDENC(cmd_enc, "already disabled\n");
+@@ -566,14 +565,7 @@ static void dpu_encoder_phys_cmd_disable(struct dpu_encoder_phys *phys_enc)
+ 			phys_enc->hw_pp->ops.disable_tearcheck(phys_enc->hw_pp);
+ 	}
+ 
+-	if (phys_enc->hw_intf->ops.bind_pingpong_blk) {
+-		phys_enc->hw_intf->ops.bind_pingpong_blk(
+-				phys_enc->hw_intf,
+-				PINGPONG_NONE);
+-
+-		ctl = phys_enc->hw_ctl;
+-		ctl->ops.update_pending_flush_intf(ctl, phys_enc->hw_intf->idx);
+-	}
++	dpu_encoder_helper_phys_cleanup(phys_enc);
+ 
+ 	phys_enc->enable_state = DPU_ENC_DISABLED;
+ }
+-- 
+2.54.0
+
