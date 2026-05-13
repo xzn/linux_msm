@@ -1,0 +1,30 @@
+From fd739ea5f6cb609a86ed16e4a073f24cda8d2528 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 12 May 2026 17:34:33 -0300
+Subject: [PATCH 10/16] drm/msm/dpu: update intf cmd cfg
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+index 99800dd2675b..30f4e853b592 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+@@ -598,9 +598,13 @@ static void dpu_hw_intf_program_intf_cmd_cfg(struct dpu_hw_intf *intf,
+ 
+ 	if (cmd_mode_cfg->data_compress)
+ 		intf_cfg2 |= INTF_CFG2_DCE_DATA_COMPRESS;
++	else
++		intf_cfg2 &= ~INTF_CFG2_DCE_DATA_COMPRESS;
+ 
+ 	if (cmd_mode_cfg->wide_bus_en)
+ 		intf_cfg2 |= INTF_CFG2_DATABUS_WIDEN;
++	else
++		intf_cfg2 &= ~INTF_CFG2_DATABUS_WIDEN;
+ 
+ 	DPU_REG_WRITE(&intf->hw, INTF_CONFIG2, intf_cfg2);
+ }
+-- 
+2.54.0
+

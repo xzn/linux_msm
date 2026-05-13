@@ -1,0 +1,302 @@
+From ffc822a927ca5aad72354b013c3d7fb71857f3cb Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 12 May 2026 02:56:27 -0300
+Subject: [PATCH 06/16] drm/msm: add extra_width and pclk_per_line handling to
+ dpu phys vid encoders
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c   | 32 +++++++++
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h   |  4 ++
+ .../drm/msm/disp/dpu1/dpu_encoder_phys_vid.c  | 12 +++-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c   | 34 ++++++++--
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h   |  2 +
+ drivers/gpu/drm/msm/dp/dp_display.c           | 67 +++++++++++++++++++
+ drivers/gpu/drm/msm/msm_drv.h                 | 12 ++++
+ 7 files changed, 155 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index eba1d52211f6..f06f0e8e74d9 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -303,6 +303,38 @@ bool dpu_encoder_is_dsc_enabled(const struct drm_encoder *drm_enc)
+ 	return dpu_enc->dsc ? true : false;
+ }
+ 
++/**
++ * dpu_encoder_get_extra_width - get extra_width for the given encoder.
++ * @drm_enc:    Pointer to previously created drm encoder structure
++ */
++u32 dpu_encoder_get_extra_width(const struct drm_encoder *drm_enc)
++{
++	struct msm_drm_private *priv = drm_enc->dev->dev_private;
++	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
++	int index = dpu_enc->disp_info.h_tile_instance[0];
++
++	if (dpu_enc->disp_info.intf_type == INTF_DP)
++		return msm_dp_dsc_get_extra_width(priv->kms->dp[index]);
++
++	return 0;
++}
++
++/**
++ * dpu_encoder_get_pclk_per_line - get pclk_per_line for the given encoder.
++ * @drm_enc:    Pointer to previously created drm encoder structure
++ */
++u32 dpu_encoder_get_pclk_per_line(const struct drm_encoder *drm_enc)
++{
++	struct msm_drm_private *priv = drm_enc->dev->dev_private;
++	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(drm_enc);
++	int index = dpu_enc->disp_info.h_tile_instance[0];
++
++	if (dpu_enc->disp_info.intf_type == INTF_DP)
++		return msm_dp_dsc_get_pclk_per_line(priv->kms->dp[index]);
++
++	return 0;
++}
++
+ /**
+  * dpu_encoder_get_crc_values_cnt - get number of physical encoders contained
+  *	in virtual encoder that can collect CRC values
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+index ca1ca2e51d7e..758714583e78 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.h
+@@ -74,6 +74,10 @@ bool dpu_encoder_is_widebus_enabled(const struct drm_encoder *drm_enc);
+ 
+ bool dpu_encoder_is_dsc_enabled(const struct drm_encoder *drm_enc);
+ 
++u32 dpu_encoder_get_extra_width(const struct drm_encoder *drm_enc);
++
++u32 dpu_encoder_get_pclk_per_line(const struct drm_encoder *drm_enc);
++
+ int dpu_encoder_get_crc_values_cnt(const struct drm_encoder *drm_enc);
+ 
+ void dpu_encoder_setup_misr(const struct drm_encoder *drm_encoder);
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+index 0ba777bda253..65a2450dad41 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+@@ -10,6 +10,7 @@
+ #include "dpu_formats.h"
+ #include "dpu_trace.h"
+ #include "disp/msm_disp_snapshot.h"
++#include "msm_dsc_helper.h"
+ 
+ #include <drm/display/drm_dsc_helper.h>
+ #include <drm/drm_managed.h>
+@@ -113,12 +114,20 @@ static void drm_mode_to_intf_timing_params(
+ 	 * for DP, divide the horizonal parameters by 2 when
+ 	 * widebus is enabled
+ 	 */
+-	if (phys_enc->hw_intf->cap->type == INTF_DP && timing->wide_bus_en) {
++	if (phys_enc->hw_intf->cap->type == INTF_DP &&
++				(timing->wide_bus_en || timing->compression_en)) {
+ 		timing->width = timing->width >> 1;
+ 		timing->xres = timing->xres >> 1;
+ 		timing->h_back_porch = timing->h_back_porch >> 1;
+ 		timing->h_front_porch = timing->h_front_porch >> 1;
+ 		timing->hsync_pulse_width = timing->hsync_pulse_width >> 1;
++
++		if (timing->compression_en) {
++			u32 extra_width = dpu_encoder_get_extra_width(phys_enc->parent);
++			timing->pclk_per_line = dpu_encoder_get_pclk_per_line(phys_enc->parent);
++			timing->width += extra_width;
++			timing->h_back_porch += extra_width;
++		}
+ 	}
+ 
+ 	/*
+@@ -136,6 +145,7 @@ static void drm_mode_to_intf_timing_params(
+ 		timing->width = timing->width * drm_dsc_get_bpp_int(dsc) /
+ 				(dsc->bits_per_component * 3);
+ 		timing->xres = timing->width;
++		timing->dce_bytes_per_line = msm_dsc_get_bytes_per_line(dsc);
+ 	}
+ }
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+index 7e620f590984..99800dd2675b 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c
+@@ -173,16 +173,31 @@ static void dpu_hw_intf_setup_timing_engine(struct dpu_hw_intf *intf,
+ 	data_width = p->width;
+ 
+ 	/*
+-	 * If widebus is enabled, data is valid for only half the active window
+-	 * since the data rate is doubled in this mode. But for the compression
+-	 * mode in DP case, the p->width is already adjusted in
+-	 * drm_mode_to_intf_timing_params()
++	 * If widebus is disabled:
++	 * For uncompressed stream, the data is valid for the entire active
++	 * window period.
++	 * For compressed stream, data is valid for a shorter time period
++	 * inside the active window depending on the compression ratio.
++	 *
++	 * If widebus is enabled:
++	 * For uncompressed stream, data is valid for only half the active
++	 * window, since the data rate is doubled in this mode.
++	 * For compressed stream, data validity window needs to be adjusted for
++	 * compression ratio and then further halved.
++	 *
++	 * For the compression mode in DP case, the p->width is already
++	 * adjusted in drm_mode_to_intf_timing_params().
+ 	 */
+-	if (p->wide_bus_en && !dp_intf)
++	if (p->compression_en && !dp_intf) {
++		if (p->wide_bus_en)
++			data_width = DIV_ROUND_UP(p->dce_bytes_per_line, 6);
++		else
++			data_width = DIV_ROUND_UP(p->dce_bytes_per_line, 3);
++	} else if (p->wide_bus_en && !dp_intf) {
+ 		data_width = p->width >> 1;
++	}
+ 
+-	/* TODO: handle DSC+DP case, we only handle DSC+DSI case so far */
+-	if (p->compression_en && !dp_intf &&
++	if (p->compression_en &&
+ 	    intf->mdss_ver->core_major_ver >= 7)
+ 		intf_cfg2 |= INTF_CFG2_DCE_DATA_COMPRESS;
+ 
+@@ -205,6 +220,11 @@ static void dpu_hw_intf_setup_timing_engine(struct dpu_hw_intf *intf,
+ 		display_hctl = active_hctl;
+ 
+ 		intf_cfg |= INTF_CFG_ACTIVE_H_EN | INTF_CFG_ACTIVE_V_EN;
++
++		if (p->compression_en) {
++			active_data_hctl = (hsync_start_x + p->pclk_per_line) << 16 | hsync_start_x;
++			display_data_hctl = active_data_hctl;
++		}
+ 	}
+ 
+ 	den_polarity = 0;
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h
+index f6ef2c21b66d..5d854e7d7a58 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.h
+@@ -35,6 +35,8 @@ struct dpu_hw_intf_timing_params {
+ 
+ 	bool wide_bus_en;
+ 	bool compression_en;
++	u32 dce_bytes_per_line;
++	u32 pclk_per_line;
+ };
+ 
+ struct dpu_hw_intf_prog_fetch {
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index c18e6b1cb979..1a7a75c0d8c0 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -15,6 +15,7 @@
+ #include <drm/display/drm_dp_aux_bus.h>
+ #include <drm/display/drm_hdmi_audio_helper.h>
+ #include <drm/drm_edid.h>
++#include <drm/drm_fixed.h>
+ 
+ #include "msm_drv.h"
+ #include "msm_kms.h"
+@@ -1530,6 +1531,72 @@ bool msm_dp_wide_bus_available(const struct msm_dp *msm_dp_display)
+ 	return dp->wide_bus_supported;
+ }
+ 
++u32 msm_dp_dsc_get_extra_width(const struct msm_dp *msm_dp_display)
++{
++	struct msm_dp_display_private *dp;
++
++	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
++
++	struct msm_dp_display_mode *msm_dp_mode = &dp->panel->msm_dp_mode;
++	struct drm_dsc_config *drm_dsc = &msm_dp_mode->drm_dsc;
++	struct msm_dp_dsc_cfg *msm_dp_dsc = &msm_dp_mode->msm_dp_dsc;
++	struct msm_dp_display_mode_cfg *mode_cfg = &msm_dp_mode->mode_cfg;
++	unsigned int dto_n = 0, dto_d = 0, remainder;
++	int ack_required, last_few_ack_required, accum_ack;
++	int last_few_pclk, last_few_pclk_required;
++	int start, temp, line_width = drm_dsc->pic_width / 2;
++	s64 temp1_fp, temp2_fp;
++
++	msm_dp_panel_get_dto_params(mode_cfg->bpp, mode_cfg->bpp / MSM_DP_DSC_COMP_RATIO, &dto_n, &dto_d);
++
++	ack_required = msm_dp_dsc->pclk_per_line + 1;
++
++	/* number of pclk cycles left outside of the complete DTO set */
++	last_few_pclk = line_width % dto_d;
++
++	/* number of pclk cycles outside of the complete dto */
++	temp1_fp = drm_fixp_from_fraction(line_width, dto_d);
++	temp2_fp = drm_fixp_from_fraction(dto_n, 1);
++	temp1_fp = drm_fixp_mul(temp1_fp, temp2_fp);
++	temp = drm_fixp2int(temp1_fp);
++	last_few_ack_required = ack_required - temp;
++
++	/*
++	 * check how many more pclk is needed to
++	 * accommodate the last few ack required
++	 */
++	remainder = dto_n;
++	accum_ack = 0;
++	last_few_pclk_required = 0;
++	while (accum_ack < last_few_ack_required) {
++		last_few_pclk_required++;
++
++		if (remainder >= dto_n)
++			start = remainder;
++		else
++			start = remainder + dto_d;
++
++		remainder = start - dto_n;
++		if (remainder < dto_n)
++			accum_ack++;
++	}
++
++	/* if fewer pclk than required */
++	if (last_few_pclk < last_few_pclk_required)
++		return last_few_pclk_required - last_few_pclk;
++
++	return 0;
++}
++
++u32 msm_dp_dsc_get_pclk_per_line(const struct msm_dp *msm_dp_display)
++{
++	struct msm_dp_display_private *dp;
++
++	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
++
++	return dp->panel->msm_dp_mode.msm_dp_dsc.pclk_per_line;
++}
++
+ void msm_dp_display_debugfs_init(struct msm_dp *msm_dp_display, struct dentry *root, bool is_edp)
+ {
+ 	struct msm_dp_display_private *dp;
+diff --git a/drivers/gpu/drm/msm/msm_drv.h b/drivers/gpu/drm/msm/msm_drv.h
+index f54d91835c22..91ab96580b9c 100644
+--- a/drivers/gpu/drm/msm/msm_drv.h
++++ b/drivers/gpu/drm/msm/msm_drv.h
+@@ -362,6 +362,8 @@ bool msm_dp_is_yuv_420_enabled(const struct msm_dp *dp_display,
+ bool msm_dp_needs_periph_flush(const struct msm_dp *dp_display,
+ 			       const struct drm_display_mode *mode);
+ bool msm_dp_wide_bus_available(const struct msm_dp *dp_display);
++u32 msm_dp_dsc_get_extra_width(const struct msm_dp *msm_dp_display);
++u32 msm_dp_dsc_get_pclk_per_line(const struct msm_dp *dp_display);
+ 
+ #else
+ static inline int __init msm_dp_register(void)
+@@ -400,6 +402,16 @@ static inline bool msm_dp_wide_bus_available(const struct msm_dp *dp_display)
+ 	return false;
+ }
+ 
++static inline u32 msm_dp_dsc_get_extra_width(const struct msm_dp *msm_dp_display)
++{
++	return 0;
++}
++
++static inline u32 msm_dp_dsc_get_pclk_per_line(const struct msm_dp *dp_display)
++{
++	return 0;
++}
++
+ #endif
+ 
+ #ifdef CONFIG_DRM_MSM_MDP4
+-- 
+2.54.0
+

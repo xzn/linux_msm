@@ -1,0 +1,51 @@
+From e165169230aba2c5788417bbb532c33a5f22ec06 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 12 May 2026 01:27:05 -0300
+Subject: [PATCH 05/16] drm/msm/dpu: allow dsc enc alloc on odd index
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c | 15 +++++++++------
+ 1 file changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
+index 7e77d88f8959..5ac5cb0daba2 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
+@@ -526,25 +526,28 @@ static int _dpu_rm_dsc_alloc(struct dpu_rm *rm,
+ 	int dsc_idx;
+ 	int ret;
+ 
+-	for (dsc_idx = 0; dsc_idx < ARRAY_SIZE(rm->dsc_blks) &&
++	pp_idx = _dpu_rm_pingpong_next_index(global_state, pp_idx, crtc_id);
++
++	for (dsc_idx = pp_idx & 0x01; dsc_idx < ARRAY_SIZE(rm->dsc_blks) &&
+ 	     num_dsc < top->num_dsc; dsc_idx++) {
++		if (pp_idx < 0)
++			return -ENAVAIL;
++
+ 		if (!rm->dsc_blks[dsc_idx])
+ 			continue;
+ 
+ 		if (reserved_by_other(global_state->dsc_to_crtc_id, dsc_idx, crtc_id))
+ 			continue;
+ 
+-		pp_idx = _dpu_rm_pingpong_next_index(global_state, pp_idx, crtc_id);
+-		if (pp_idx < 0)
+-			return -ENAVAIL;
+-
+ 		ret = _dpu_rm_pingpong_dsc_check(dsc_idx, pp_idx);
+ 		if (ret)
+-			return -ENAVAIL;
++			continue;
+ 
+ 		global_state->dsc_to_crtc_id[dsc_idx] = crtc_id;
+ 		num_dsc++;
+ 		pp_idx++;
++
++		pp_idx = _dpu_rm_pingpong_next_index(global_state, pp_idx, crtc_id);
+ 	}
+ 
+ 	if (num_dsc < top->num_dsc) {
+-- 
+2.54.0
+

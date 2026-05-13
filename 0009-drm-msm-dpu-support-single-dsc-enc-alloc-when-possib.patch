@@ -1,0 +1,65 @@
+From bfd724ab118ef4b02c037fbd1c05c76156b01251 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 12 May 2026 11:33:02 -0300
+Subject: [PATCH 09/16] drm/msm/dpu: support single dsc enc alloc when possible
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c    |  7 +++----
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c | 14 +++++++++-----
+ 2 files changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+index cbb7caa194c1..11ae24b8311c 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -1408,10 +1408,9 @@ static struct msm_display_topology dpu_crtc_get_topology(
+ 
+ 	if (topology.num_intf == 2 && !topology.cwb_enabled)
+ 		topology.num_lm = 2;
+-	else if (topology.num_dsc == 2)
+-		topology.num_lm = 2;
+-	else if (dpu_kms->catalog->caps->has_3d_merge &&
+-		 topology.num_dsc == 0)
++	else if (topology.num_dsc)
++		topology.num_lm = topology.num_dsc;
++	else if (dpu_kms->catalog->caps->has_3d_merge)
+ 		topology.num_lm = (mode->hdisplay > MAX_HDISPLAY_SPLIT) ? 2 : 1;
+ 	else
+ 		topology.num_lm = 1;
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+index 6f3b06a6e3c0..1595204b02e6 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder.c
+@@ -734,7 +734,6 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
+ 
+ 	dsc_cfg = dpu_encoder_get_mode_dsc_cfg(drm_enc, adj_mode);
+ 
+-	/* We only support 2 DSC mode (with 2 LM and 1 INTF) */
+ 	if (dsc_cfg >= MSM_MODE_DSC_PREFERRED) {
+ 		/*
+ 		 * Use 2 DSC encoders, 2 layer mixers and 1 or 2 interfaces
+@@ -743,12 +742,17 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
+ 		 * This is power-optimal and can drive up to (including) 4k
+ 		 * screens.
+ 		 */
+-		WARN(topology->num_intf > 2,
+-		     "DSC topology cannot support more than 2 interfaces\n");
+-		if (topology->num_intf >= 2 || dpu_kms->catalog->dsc_count >= 2)
++		if ((topology->num_intf == 2 ||
++					adj_mode->hdisplay > dpu_kms->catalog->caps->max_mixer_width) &&
++							dpu_kms->catalog->dsc_count >= 2)
+ 			topology->num_dsc = 2;
+-		else
++		else if (topology->num_intf == 1 &&
++					adj_mode->hdisplay <= dpu_kms->catalog->caps->max_mixer_width)
+ 			topology->num_dsc = 1;
++		else
++			WARN(1,
++					"dsc not supported for configuration num_intf=%d hdisplay=%d\n",
++					topology->num_intf, adj_mode->hdisplay);
+ 	}
+ 
+ 	connector = drm_atomic_get_new_connector_for_encoder(state, drm_enc);
+-- 
+2.54.0
+
