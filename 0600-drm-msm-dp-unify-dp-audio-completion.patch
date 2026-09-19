@@ -1,0 +1,160 @@
+From 27b02059ffc9e55bd3f064938a96978acda3cf51 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 20 Oct 2026 18:16:03 -0300
+Subject: [PATCH 600/600] drm/msm/dp: unify dp audio completion
+
+---
+ drivers/gpu/drm/msm/dp/dp_audio.c         | 11 ++++--
+ drivers/gpu/drm/msm/dp/dp_display.c       | 45 ++++++++++-------------
+ drivers/gpu/drm/msm/dp/dp_display.h       |  3 +-
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c | 26 +++++++------
+ 4 files changed, 43 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_audio.c b/drivers/gpu/drm/msm/dp/dp_audio.c
+index 41018e82efa1..a21cd28ec4ae 100644
+--- a/drivers/gpu/drm/msm/dp/dp_audio.c
++++ b/drivers/gpu/drm/msm/dp/dp_audio.c
+@@ -301,7 +301,6 @@ int msm_dp_audio_prepare(struct drm_bridge *bridge,
+ 	msm_dp_audio_setup_acr(audio);
+ 	msm_dp_audio_safe_to_exit_level(audio);
+ 	msm_dp_audio_enable(audio, true);
+-	msm_dp_display_signal_audio_start(msm_dp_display);
+ 	msm_dp_display->audio_enabled = true;
+ 
+ end:
+@@ -315,10 +314,11 @@ void msm_dp_audio_shutdown(struct drm_bridge *bridge,
+ 	struct msm_dp *msm_dp_display;
+ 
+ 	msm_dp_display = to_dp_bridge(bridge)->msm_dp_display;
++
+ 	audio = msm_dp_audio_get_data(msm_dp_display);
+ 	if (IS_ERR(audio)) {
+ 		DRM_ERROR("failed to get audio data\n");
+-		return;
++		goto end;
+ 	}
+ 
+ 	/*
+@@ -330,11 +330,14 @@ void msm_dp_audio_shutdown(struct drm_bridge *bridge,
+ 	 * to false earlier than this call
+ 	 */
+ 	if (!msm_dp_display->audio_enabled)
+-		return;
++		goto end;
+ 
+ 	msm_dp_audio_enable(audio, false);
++	msm_dp_display->audio_enabled = false;
++
++end:
+ 	/* signal the dp display to safely shutdown clocks */
+-	msm_dp_display_signal_audio_complete(msm_dp_display);
++	msm_dp_display_signal_audio(msm_dp_display);
+ }
+ 
+ struct msm_dp_audio *msm_dp_audio_get(struct platform_device *pdev,
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 70a647ed5e33..885a7c146d06 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -204,16 +204,7 @@ static struct msm_dp_display_private *dev_get_dp_display_private(struct device *
+ 	return container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ }
+ 
+-void msm_dp_display_signal_audio_start(struct msm_dp *msm_dp_display)
+-{
+-	struct msm_dp_display_private *dp;
+-
+-	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+-
+-	reinit_completion(&dp->audio_comp);
+-}
+-
+-void msm_dp_display_signal_audio_complete(struct msm_dp *msm_dp_display)
++void msm_dp_display_signal_audio(struct msm_dp *msm_dp_display)
+ {
+ 	struct msm_dp_display_private *dp;
+ 
+@@ -493,9 +484,12 @@ static void msm_dp_display_handle_plugged_change(struct msm_dp *msm_dp_display,
+ 			struct msm_dp_display_private, msm_dp_display);
+ 
+ 	/* notify audio subsystem only if sink supports audio */
+-	if (dp->audio_supported)
++	if (dp->audio_supported) {
++		DRM_INFO("msm-dp: notifying hdmi audio plugged=%d\n", plugged);
++
+ 		drm_connector_hdmi_audio_plugged_notify(msm_dp_display->connector,
+ 							plugged);
++	}
+ }
+ 
+ static int msm_dp_hpd_unplug_handle_guarded(struct msm_dp_display_private *dp)
+@@ -715,24 +709,18 @@ static int msm_dp_display_disable(struct msm_dp_display_private *dp)
+ 	if (!msm_dp_display->power_on)
+ 		return 0;
+ 
+-	/* wait only if audio was enabled */
+ 	if (msm_dp_display->audio_enabled) {
++		reinit_completion(&dp->audio_comp);
++
+ 		/* signal the disconnect event */
+ 		msm_dp_display_handle_plugged_change(msm_dp_display, false);
++
+ 		if (!wait_for_completion_timeout(&dp->audio_comp,
+ 				HZ * 5))
+ 			DRM_ERROR("audio comp timeout\n");
+ 	}
+ 
+-	msm_dp_display->audio_enabled = false;
+-
+-	if (dp->link->sink_count == 0) {
+-		/*
+-		 * irq_hpd with sink_count = 0
+-		 * hdmi unplugged out of dongle
+-		 */
+-		msm_dp_ctrl_off_link_stream(dp->ctrl);
+-	} else {
++	if (dp->plugged_pending > PLUGGED_PENDING_NONE) {
+ 		/*
+ 		 * unplugged interrupt
+ 		 * dongle unplugged out of DUT
+@@ -744,6 +732,12 @@ static int msm_dp_display_disable(struct msm_dp_display_private *dp)
+ 		 * dp phy is powered off so there should be no interference.
+ 		 * Otherwise mux mode may dangle leading to device hang. */
+ 		msm_dp_display_pmic_glink_notify(dp);
++	} else {
++		/*
++		 * irq_hpd with sink_count = 0
++		 * hdmi unplugged out of dongle
++		 */
++		msm_dp_ctrl_off_link_stream(dp->ctrl);
+ 	}
+ 
+ 	msm_dp_display->power_on = false;
+@@ -756,10 +750,9 @@ static int msm_dp_display_disable(struct msm_dp_display_private *dp)
+ 		msm_dp_hpd_plug_handle_guarded(dp);
+ 
+ 		schedule_work(&dp->plugged_retry_work);
+-	}
+-
+-	/* also reset for all other cases */
+-	dp->plugged_pending = PLUGGED_PENDING_NONE;
++	} else
++		/* also reset for all other cases */
++		dp->plugged_pending = PLUGGED_PENDING_NONE;
+ 
+ 	drm_dbg_dp(dp->drm_dev, "sink count: %d\n", dp->link->sink_count);
+ 	return 0;
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.h b/drivers/gpu/drm/msm/dp/dp_display.h
+index 89230d6890f8..a317a79ab81b 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.h
++++ b/drivers/gpu/drm/msm/dp/dp_display.h
+@@ -28,8 +28,7 @@ struct msm_dp {
+ 
+ bool msm_dp_display_check_video_test(struct msm_dp *msm_dp_display);
+ int msm_dp_display_get_test_bpp(struct msm_dp *msm_dp_display);
+-void msm_dp_display_signal_audio_start(struct msm_dp *msm_dp_display);
+-void msm_dp_display_signal_audio_complete(struct msm_dp *msm_dp_display);
++void msm_dp_display_signal_audio(struct msm_dp *msm_dp_display);
+ void msm_dp_display_set_psr(struct msm_dp *dp, bool enter);
+ void msm_dp_display_debugfs_init(struct msm_dp *msm_dp_display, struct dentry *dentry, bool is_edp);
+ 
