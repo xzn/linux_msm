@@ -1,0 +1,301 @@
+From 8749573c569b8f652ec76229f8bb8c5e616b23fb Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Wed, 21 Oct 2026 22:47:15 -0300
+Subject: [PATCH 605/605] drm/msm/dp: dto reg ack
+
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c  | 136 +++++++++++++++---------------
+ drivers/gpu/drm/msm/dp/dp_panel.c |  35 ++++----
+ drivers/gpu/drm/msm/dp/dp_panel.h |   4 +-
+ 3 files changed, 87 insertions(+), 88 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index bd1c33884740..699a429165a2 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -467,8 +467,9 @@ static void msm_dp_ctrl_config_dsc_dto(struct msm_dp_ctrl_private *ctrl, bool en
+ 	u32 reg = 0;
+ 	struct msm_dp_dsc_cfg *msm_dp_dsc = &ctrl->panel->msm_dp_mode.msm_dp_dsc;
+ 
+-	msm_dp_panel_config_dsc_dto(ctrl->panel, enable);
+ 	if (enable) {
++		msm_dp_panel_config_dsc_dto(ctrl->panel);
++
+ 		u32 eol_byte_num = msm_dp_dsc->eol_byte_num;
+ 		u32 slice_per_pkt = msm_dp_dsc->slice_per_pkt - 1;
+ 		u32 bytes_per_pkt = msm_dp_dsc->bytes_per_pkt / msm_dp_dsc->slice_per_pkt;
+@@ -912,63 +913,6 @@ static int msm_dp_ctrl_link_train_1_2(struct msm_dp_ctrl_private *ctrl,
+ 	return 0;
+ }
+ 
+-static int msm_dp_ctrl_link_train(struct msm_dp_ctrl_private *ctrl,
+-			int *training_step)
+-{
+-	int i;
+-	int ret = 0;
+-	const u8 *dpcd = ctrl->panel->dpcd;
+-	u8 encoding[] = { 0, DP_SET_ANSI_8B10B };
+-	u8 assr;
+-	struct msm_dp_link_info link_info = {0};
+-
+-	msm_dp_ctrl_config_ctrl(ctrl);
+-
+-	link_info.num_lanes = ctrl->link->link_params.num_lanes;
+-	link_info.rate = ctrl->link->link_params.rate;
+-	link_info.capabilities = DP_LINK_CAP_ENHANCED_FRAMING;
+-
+-	msm_dp_aux_link_configure(ctrl->aux, &link_info);
+-
+-	if (drm_dp_max_downspread(dpcd))
+-		encoding[0] |= DP_SPREAD_AMP_0_5;
+-
+-	/* config DOWNSPREAD_CTRL and MAIN_LINK_CHANNEL_CODING_SET */
+-	drm_dp_dpcd_write(ctrl->aux, DP_DOWNSPREAD_CTRL, encoding, 2);
+-
+-	if (drm_dp_alternate_scrambler_reset_cap(dpcd)) {
+-		assr = DP_ALTERNATE_SCRAMBLER_RESET_ENABLE;
+-		drm_dp_dpcd_write(ctrl->aux, DP_EDP_CONFIGURATION_SET,
+-				&assr, 1);
+-	}
+-
+-	for (i = ctrl->link->lttpr_count - 1; i >= 0; i--) {
+-		enum drm_dp_phy dp_phy = DP_PHY_LTTPR(i);
+-
+-		ret = msm_dp_ctrl_link_train_1_2(ctrl, training_step, dp_phy);
+-		msm_dp_ctrl_clear_training_pattern(ctrl, dp_phy);
+-
+-		if (ret)
+-			break;
+-	}
+-
+-	if (ret) {
+-		DRM_ERROR("link training of LTTPR(s) failed. ret=%d\n", ret);
+-		goto end;
+-	}
+-
+-	ret = msm_dp_ctrl_link_train_1_2(ctrl, training_step, DP_PHY_DPRX);
+-	if (ret) {
+-		DRM_ERROR("link training on sink failed. ret=%d\n", ret);
+-		goto end;
+-	}
+-
+-end:
+-	msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, 0);
+-
+-	return ret;
+-}
+-
+ static void msm_dp_ctrl_sink_fec_enable(struct msm_dp_ctrl_private *ctrl,
+ 			bool enable)
+ {
+@@ -1026,6 +970,66 @@ static void msm_dp_ctrl_sink_dsc_enable(struct msm_dp_ctrl_private *ctrl)
+ 		DRM_ERROR("failed to set sink dsc\n");
+ }
+ 
++static int msm_dp_ctrl_link_train(struct msm_dp_ctrl_private *ctrl,
++			int *training_step)
++{
++	int i;
++	int ret = 0;
++	const u8 *dpcd = ctrl->panel->dpcd;
++	u8 encoding[] = { 0, DP_SET_ANSI_8B10B };
++	u8 assr;
++	struct msm_dp_link_info link_info = {0};
++
++	msm_dp_ctrl_config_ctrl(ctrl);
++
++	link_info.num_lanes = ctrl->link->link_params.num_lanes;
++	link_info.rate = ctrl->link->link_params.rate;
++	link_info.capabilities = DP_LINK_CAP_ENHANCED_FRAMING;
++
++	msm_dp_aux_link_configure(ctrl->aux, &link_info);
++
++	if (drm_dp_max_downspread(dpcd))
++		encoding[0] |= DP_SPREAD_AMP_0_5;
++
++	/* config DOWNSPREAD_CTRL and MAIN_LINK_CHANNEL_CODING_SET */
++	drm_dp_dpcd_write(ctrl->aux, DP_DOWNSPREAD_CTRL, encoding, 2);
++
++	if (drm_dp_alternate_scrambler_reset_cap(dpcd)) {
++		assr = DP_ALTERNATE_SCRAMBLER_RESET_ENABLE;
++		drm_dp_dpcd_write(ctrl->aux, DP_EDP_CONFIGURATION_SET,
++				&assr, 1);
++	}
++
++	if (ctrl->panel->fec_cap.supported)
++		msm_dp_ctrl_host_fec_stop(ctrl);
++
++	for (i = ctrl->link->lttpr_count - 1; i >= 0; i--) {
++		enum drm_dp_phy dp_phy = DP_PHY_LTTPR(i);
++
++		ret = msm_dp_ctrl_link_train_1_2(ctrl, training_step, dp_phy);
++		msm_dp_ctrl_clear_training_pattern(ctrl, dp_phy);
++
++		if (ret)
++			break;
++	}
++
++	if (ret) {
++		DRM_ERROR("link training of LTTPR(s) failed. ret=%d\n", ret);
++		goto end;
++	}
++
++	ret = msm_dp_ctrl_link_train_1_2(ctrl, training_step, DP_PHY_DPRX);
++	if (ret) {
++		DRM_ERROR("link training on sink failed. ret=%d\n", ret);
++		goto end;
++	}
++
++end:
++	msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, 0);
++
++	return ret;
++}
++
+ static int msm_dp_ctrl_setup_main_link(struct msm_dp_ctrl_private *ctrl,
+ 			int *training_step)
+ {
+@@ -1037,14 +1041,15 @@ static int msm_dp_ctrl_setup_main_link(struct msm_dp_ctrl_private *ctrl,
+ 	if (ctrl->link->sink_request & DP_TEST_LINK_PHY_TEST_PATTERN)
+ 		return ret;
+ 
+-	if (ctrl->panel->fec_cap.supported)
+-		msm_dp_ctrl_sink_fec_enable(ctrl, ctrl->panel->fec_cap.enabled);
+-
+ 	/*
+ 	 * As part of previous calls, DP controller state might have
+ 	 * transitioned to PUSH_IDLE. In order to start transmitting
+ 	 * a link training pattern, we have to first do soft reset.
+ 	 */
++	msm_dp_ctrl_reset(&ctrl->msm_dp_ctrl);
++
++	if (ctrl->panel->fec_cap.supported)
++		msm_dp_ctrl_sink_fec_enable(ctrl, ctrl->panel->fec_cap.enabled);
+ 
+ 	ret = msm_dp_ctrl_link_train(ctrl, training_step);
+ 
+@@ -2036,14 +2041,11 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, bool force_link_train
+ 		msm_dp_ctrl_config_dsc_dto(ctrl, ctrl->panel->dsc_cap.enabled);
+ 		msm_dp_ctrl_dsc_commit_pps(ctrl);
+ 		msm_dp_ctrl_pps_flush(ctrl);
+-	} else {
+-		msm_dp_panel_config_dsc_dto(ctrl->panel, false);
+ 	}
+ 
+ 	msm_dp_ctrl_setup_tr_unit(ctrl);
+ 
+-	if (ctrl->panel->dsc_cap.supported)
+-		msm_dp_panel_override_ack_dto(ctrl->panel, true);
++	msm_dp_panel_override_ack_dto(ctrl->panel, false);
+ 
+ 	msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, DP_STATE_CTRL_SEND_VIDEO);
+ 
+@@ -2082,8 +2084,8 @@ void msm_dp_ctrl_off_link_stream(struct msm_dp_ctrl *msm_dp_ctrl)
+ 		msm_dp_ctrl_host_fec_stop(ctrl);
+ 	if (ctrl->panel->dsc_cap.supported) {
+ 		msm_dp_ctrl_config_dsc_dto(ctrl, false);
+-		msm_dp_panel_override_ack_dto(ctrl->panel, false);
+ 	}
++	msm_dp_panel_override_ack_dto(ctrl->panel, true);
+ 
+ 	/* set dongle to D3 (power off) mode */
+ 	msm_dp_link_psm_config(ctrl->link, &ctrl->panel->link_info, true);
+@@ -2119,8 +2121,8 @@ void msm_dp_ctrl_off(struct msm_dp_ctrl *msm_dp_ctrl)
+ 		msm_dp_ctrl_host_fec_stop(ctrl);
+ 	if (ctrl->panel->dsc_cap.supported) {
+ 		msm_dp_ctrl_config_dsc_dto(ctrl, false);
+-		msm_dp_panel_override_ack_dto(ctrl->panel, false);
+ 	}
++	msm_dp_panel_override_ack_dto(ctrl->panel, true);
+ 
+ 	msm_dp_ctrl_mainlink_disable(ctrl);
+ 
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.c b/drivers/gpu/drm/msm/dp/dp_panel.c
+index d42478d6ecae..2124c1b326e4 100644
+--- a/drivers/gpu/drm/msm/dp/dp_panel.c
++++ b/drivers/gpu/drm/msm/dp/dp_panel.c
+@@ -1393,13 +1393,12 @@ u8 msm_dp_panel_get_colorimetry_config(struct msm_dp_panel *msm_dp_panel)
+ 	return colorimetry;
+ }
+ 
+-void msm_dp_panel_config_dsc_dto(struct msm_dp_panel *msm_dp_panel, bool enable)
++void msm_dp_panel_config_dsc_dto(struct msm_dp_panel *msm_dp_panel)
+ {
+ 	struct msm_dp_panel_private *panel;
+ 	struct msm_dp_dsc_cfg *msm_dp_dsc;
+-	u32 reg = 0;
++	u32 reg;
+ 
+-	bool dto_en = enable;
+ 	u32 dto_n;
+ 	u32 dto_d;
+ 	u32 dto_count = 0;
+@@ -1411,25 +1410,23 @@ void msm_dp_panel_config_dsc_dto(struct msm_dp_panel *msm_dp_panel, bool enable)
+ 
+ 	panel = container_of(msm_dp_panel, struct msm_dp_panel_private, msm_dp_panel);
+ 
+-	if (dto_en) {
+-		msm_dp_dsc = &msm_dp_panel->msm_dp_mode.msm_dp_dsc;
++	msm_dp_dsc = &msm_dp_panel->msm_dp_mode.msm_dp_dsc;
+ 
+-		dto_count = msm_dp_dsc->pclk_per_line;
+-		dto_n = msm_dp_dsc->dto.dto_n;
+-		dto_d = msm_dp_dsc->dto.dto_d;
++	dto_count = msm_dp_dsc->pclk_per_line;
++	dto_n = msm_dp_dsc->dto.dto_n;
++	dto_d = msm_dp_dsc->dto.dto_d;
+ 
+-		msm_dp_read_p0(panel, MMSS_DP_DSC_DTO);
+-		reg |= BIT(0);
+-		reg |= BIT(3);
+-		reg |= (dto_n << 8);
+-		reg |= (dto_d << 16);
++	reg = msm_dp_read_p0(panel, MMSS_DP_DSC_DTO);
++	reg |= BIT(0);
++	reg |= BIT(3);
++	reg |= (dto_n << 8);
++	reg |= (dto_d << 16);
+ 
+-		msm_dp_write_p0(panel, MMSS_DP_DSC_DTO_COUNT, dto_count);
+-	}
++	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO_COUNT, dto_count);
+ 	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO, reg);
+ }
+ 
+-void msm_dp_panel_override_ack_dto(struct msm_dp_panel *msm_dp_panel, bool not_ack)
++void msm_dp_panel_override_ack_dto(struct msm_dp_panel *msm_dp_panel, bool ack)
+ {
+ 	struct msm_dp_panel_private *panel;
+ 	u32 dsc_dto;
+@@ -1442,10 +1439,10 @@ void msm_dp_panel_override_ack_dto(struct msm_dp_panel *msm_dp_panel, bool not_a
+ 	panel = container_of(msm_dp_panel, struct msm_dp_panel_private, msm_dp_panel);
+ 
+ 	dsc_dto = msm_dp_read_p0(panel, MMSS_DP_DSC_DTO);
+-	if (not_ack)
+-		dsc_dto &= ~BIT(1);
+-	else
++	if (ack)
+ 		dsc_dto = BIT(1);
++	else
++		dsc_dto &= ~BIT(1);
+ 
+ 	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO, dsc_dto);
+ }
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.h b/drivers/gpu/drm/msm/dp/dp_panel.h
+index 8f2ea7b7bef4..cde5c746d028 100644
+--- a/drivers/gpu/drm/msm/dp/dp_panel.h
++++ b/drivers/gpu/drm/msm/dp/dp_panel.h
+@@ -116,8 +116,8 @@ void msm_dp_panel_handle_sink_request(struct msm_dp_panel *msm_dp_panel);
+ void msm_dp_panel_tpg_config(struct msm_dp_panel *msm_dp_panel, bool enable);
+ 
+ u8 msm_dp_panel_get_colorimetry_config(struct msm_dp_panel *msm_dp_panel);
+-void msm_dp_panel_config_dsc_dto(struct msm_dp_panel *msm_dp_panel, bool enable);
+-void msm_dp_panel_override_ack_dto(struct msm_dp_panel *msm_dp_panel, bool not_ack);
++void msm_dp_panel_config_dsc_dto(struct msm_dp_panel *msm_dp_panel);
++void msm_dp_panel_override_ack_dto(struct msm_dp_panel *msm_dp_panel, bool ack);
+ 
+ void msm_dp_panel_enable_vsc_sdp(struct msm_dp_panel *msm_dp_panel, struct dp_sdp *vsc_sdp);
+ void msm_dp_panel_disable_vsc_sdp(struct msm_dp_panel *msm_dp_panel);
+-- 
+2.55.0
+

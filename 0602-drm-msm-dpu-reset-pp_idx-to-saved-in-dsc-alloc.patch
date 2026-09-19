@@ -1,0 +1,42 @@
+From 7ae39328557f4393c123d266459694697c67bfcc Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Wed, 21 Oct 2026 16:33:20 -0300
+Subject: [PATCH 602/602] drm/msm/dpu: reset pp_idx to saved in dsc alloc
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
+index 5ac5cb0daba2..dd8be5bdfc06 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
+@@ -571,6 +571,7 @@ static int _dpu_rm_dsc_alloc_pair(struct dpu_rm *rm,
+ 	/* only start from even dsc index */
+ 	for (dsc_idx = 0; dsc_idx < ARRAY_SIZE(rm->dsc_blks) &&
+ 	     num_dsc < top->num_dsc; dsc_idx += 2) {
++		int pp_idx_saved = pp_idx;
+ 		if (!rm->dsc_blks[dsc_idx] ||
+ 		    !rm->dsc_blks[dsc_idx + 1])
+ 			continue;
+@@ -586,7 +587,7 @@ static int _dpu_rm_dsc_alloc_pair(struct dpu_rm *rm,
+ 
+ 		ret = _dpu_rm_pingpong_dsc_check(dsc_idx, pp_idx);
+ 		if (ret) {
+-			pp_idx = 0;
++			pp_idx = pp_idx_saved;
+ 			continue;
+ 		}
+ 
+@@ -596,7 +597,7 @@ static int _dpu_rm_dsc_alloc_pair(struct dpu_rm *rm,
+ 
+ 		ret = _dpu_rm_pingpong_dsc_check(dsc_idx + 1, pp_idx);
+ 		if (ret) {
+-			pp_idx = 0;
++			pp_idx = pp_idx_saved;
+ 			continue;
+ 		}
+ 
+-- 
+2.55.0
+

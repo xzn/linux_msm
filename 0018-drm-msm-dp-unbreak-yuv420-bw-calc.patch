@@ -1,0 +1,39 @@
+From c5fcba8eca84ca826f3e76b77ea71c2add0cdf14 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 6 Oct 2026 19:47:48 -0300
+Subject: [PATCH 18/18] drm/msm/dp: unbreak yuv420 bw calc
+
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 1 +
+ drivers/gpu/drm/msm/dp/dp_panel.c   | 3 +++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 9f28883dda80..d44f39c344c2 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -810,6 +810,7 @@ enum drm_mode_status msm_dp_bridge_mode_valid(struct drm_bridge *bridge,
+ 		mode_bpp = default_bpp;
+ 
+ 	drm_mode_copy(&msm_dp_mode.drm_mode, mode);
++	msm_dp_mode.out_fmt_is_yuv_420 = is_yuv_420;
+ 
+ 	/* Currently no dsc and yuv420 together */
+ 	msm_dp_mode.mode_cfg = msm_dp_panel_get_mode_cfg(msm_dp_display->panel,
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.c b/drivers/gpu/drm/msm/dp/dp_panel.c
+index 5bf9195f68be..d42478d6ecae 100644
+--- a/drivers/gpu/drm/msm/dp/dp_panel.c
++++ b/drivers/gpu/drm/msm/dp/dp_panel.c
+@@ -371,6 +371,9 @@ static struct msm_dp_display_mode_cfg msm_dp_panel_get_supported_cfg(
+ 	u8 tgt_bpp = 0;
+ 	u32 mode_pclk_khz = msm_dp_mode->drm_mode.clock;
+ 
++	if (msm_dp_mode->out_fmt_is_yuv_420)
++		mode_pclk_khz /= 2;
++
+ 	if (dsc_cfg < MSM_MODE_DSC_REQUIRED)
+ 		bpp = msm_dp_panel_get_supported_bpp_no_dsc(
+ 					mode_edid_bpp,
+-- 
+2.55.0
+
