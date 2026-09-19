@@ -1,0 +1,2032 @@
+From 3430610def6616b167b9056cefd84fb123774520 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Mon, 5 Oct 2026 11:18:56 -0300
+Subject: [PATCH 08/28] drm/bridge: Add flag to allow hpd_notify to be skipped
+ after detect.
+
+Useful when bridge_detect is not the source of truth for hpd, and would
+otherwise race.
+---
+ drivers/gpu/drm/display/drm_bridge_connector.c | 17 ++++++++++++++---
+ include/drm/drm_bridge.h                       |  7 +++++++
+ 2 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/display/drm_bridge_connector.c b/drivers/gpu/drm/display/drm_bridge_connector.c
+index 8b54069fa53a..2efcec7777df 100644
+--- a/drivers/gpu/drm/display/drm_bridge_connector.c
++++ b/drivers/gpu/drm/display/drm_bridge_connector.c
+@@ -131,6 +131,14 @@ struct drm_bridge_connector {
+ 	 * bridge connector.
+ 	 */
+ 	struct drm_connector_hdmi_funcs hdmi_funcs;
++
++	/**
++	 * @detect_no_hpd:
++	 *
++	 * Whether to skip hpd_notify when bridge_detect is called.
++	 * Determined by DRM_BRIDGE_OP_DETECT_NO_HPD.
++	 */
++	bool detect_no_hpd;
+ };
+ 
+ #define to_drm_bridge_connector(x) \
+@@ -220,10 +228,12 @@ drm_bridge_connector_detect(struct drm_connector *connector, bool force)
+ 	if (detect) {
+ 		status = detect->funcs->detect(detect, connector);
+ 
+-		if (hdmi)
+-			drm_atomic_helper_connector_hdmi_hotplug(connector, status);
++		if (!bridge_connector->detect_no_hpd) {
++			if (hdmi)
++				drm_atomic_helper_connector_hdmi_hotplug(connector, status);
+ 
+-		drm_bridge_connector_hpd_notify(connector, status);
++			drm_bridge_connector_hpd_notify(connector, status);
++		}
+ 	} else {
+ 		switch (connector->connector_type) {
+ 		case DRM_MODE_CONNECTOR_DPI:
+@@ -881,6 +891,7 @@ struct drm_connector *drm_bridge_connector_init(struct drm_device *drm,
+ 		if (bridge->ops & DRM_BRIDGE_OP_DETECT) {
+ 			drm_bridge_put(bridge_connector->bridge_detect);
+ 			bridge_connector->bridge_detect = drm_bridge_get(bridge);
++			bridge_connector->detect_no_hpd = !!(bridge->ops & DRM_BRIDGE_OP_DETECT_NO_HPD);
+ 		}
+ 		if (bridge->ops & DRM_BRIDGE_OP_HDMI) {
+ 			if (bridge_connector->bridge_hdmi)
+diff --git a/include/drm/drm_bridge.h b/include/drm/drm_bridge.h
+index 58fff047f43b..de6cf89f39cd 100644
+--- a/include/drm/drm_bridge.h
++++ b/include/drm/drm_bridge.h
+@@ -986,6 +986,13 @@ enum drm_bridge_ops {
+ 	 * &drm_bridge_funcs->hdmi_clear_spd_infoframe callbacks.
+ 	 */
+ 	DRM_BRIDGE_OP_HDMI_SPD_INFOFRAME = BIT(10),
++	/**
++	 * @DRM_BRIDGE_OP_DETECT_NO_HPD: The bridge will skip hpd_notify
++	 * when bridge_detect is called.
++	 * Set when bridge_detect is not the source of truth for HPD
++	 * in order to avoid race.
++	 */
++	DRM_BRIDGE_OP_DETECT_NO_HPD = BIT(11),
+ };
+ 
+ /**
+-- 
+2.56.0
+
+
+From 4182412521ad199123a57816f797c6468e639dee Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Mon, 5 Oct 2026 11:22:54 -0300
+Subject: [PATCH 09/28] drm/msm/dp: Do not call hpd_notify after bridge_detect
+
+dp_display handles hpd_notify either from its internal hpd or pmic_glink
+in case of type-c mux. Calling hpd_notify after detect can race and
+sporadically fail hotplug.
+---
+ drivers/gpu/drm/msm/dp/dp_drm.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_drm.c b/drivers/gpu/drm/msm/dp/dp_drm.c
+index c1e4147bfef1..5e9ad6430038 100644
+--- a/drivers/gpu/drm/msm/dp/dp_drm.c
++++ b/drivers/gpu/drm/msm/dp/dp_drm.c
+@@ -322,6 +322,7 @@ int msm_dp_bridge_init(struct msm_dp *msm_dp_display, struct drm_device *dev,
+ 		bridge->ops =
+ 			DRM_BRIDGE_OP_DP_AUDIO |
+ 			DRM_BRIDGE_OP_DETECT |
++			DRM_BRIDGE_OP_DETECT_NO_HPD |
+ 			DRM_BRIDGE_OP_HPD |
+ 			DRM_BRIDGE_OP_MODES;
+ 		bridge->hdmi_audio_dev = &msm_dp_display->pdev->dev;
+-- 
+2.56.0
+
+
+From 5b06de4b8e62dbb39ba6f0a958e6603f3c2a672d Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Mon, 5 Oct 2026 11:31:32 -0300
+Subject: [PATCH 10/28] drm/msm/dp: guard dp phy init with plugged state and
+ simplify bridge_detect
+
+There's no guarantee that msm_dp_hpd_plug_handle will be called in pairs
+with msm_dp_hpd_unplug_handle from either internal hpd or pmic_glink.
+
+Guard the call to resume dp dev to avoid unbalanced pm resume and suspend.
+
+Similar problem exists in bridge_detect; since that function isn't used as
+the source of truth for hpd, simplify it instead.
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 85 ++++-------------------------
+ 1 file changed, 12 insertions(+), 73 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index bce641d7d893..d543999ce586 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -417,15 +417,19 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 
+ 	guard(mutex)(&dp->plugged_lock);
+ 
+-	ret = pm_runtime_resume_and_get(&pdev->dev);
+-	if (ret) {
+-		DRM_ERROR("failed to pm_runtime_resume\n");
+-		return ret;
+-	}
++	if (!dp->plugged) {
++		ret = pm_runtime_resume_and_get(&pdev->dev);
++		if (ret) {
++			DRM_ERROR("failed to pm_runtime_resume\n");
++			return ret;
++		}
+ 
+-	msm_dp_aux_enable_xfers(dp->aux, true);
++		msm_dp_aux_enable_xfers(dp->aux, true);
+ 
+-	msm_dp_display_host_phy_init(dp);
++		msm_dp_display_host_phy_init(dp);
++
++		dp->plugged = true;
++	}
+ 
+ 	ret = msm_dp_display_process_hpd_high(dp);
+ 
+@@ -433,8 +437,6 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 			dp->msm_dp_display.connector_type,
+ 			dp->link->sink_count);
+ 
+-	dp->plugged = true;
+-
+ 	return ret;
+ };
+ 
+@@ -899,77 +901,14 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
+ {
+ 	struct msm_dp_bridge *msm_dp_bridge = to_dp_bridge(bridge);
+ 	struct msm_dp *dp = msm_dp_bridge->msm_dp_display;
+-	int status = connector_status_disconnected;
+ 	struct msm_dp_display_private *priv;
+-	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+-	struct drm_dp_desc desc;
+-	bool phy_deinit;
+-	int ret;
+ 
+ 	dp = to_dp_bridge(bridge)->msm_dp_display;
+ 
+ 	priv = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 
+ 	guard(mutex)(&priv->plugged_lock);
+-	ret = pm_runtime_resume_and_get(&dp->pdev->dev);
+-	if (ret) {
+-		DRM_ERROR("failed to pm_runtime_resume\n");
+-		return status;
+-	}
+-
+-	phy_deinit = msm_dp_display_host_phy_init(priv);
+-
+-	msm_dp_aux_enable_xfers(priv->aux, true);
+-
+-	ret = msm_dp_aux_is_link_connected(priv->aux);
+-	DRM_DEBUG_DP("aux link status: %x\n", ret);
+-	if (!priv->plugged && !ret) {
+-		DRM_DEBUG_DP("aux not connected\n");
+-		priv->plugged = false;
+-		goto end;
+-	}
+-
+-	ret = drm_dp_read_dpcd_caps(priv->aux, dpcd);
+-	if (ret) {
+-		DRM_DEBUG_DP("failed to read caps\n");
+-		priv->plugged = false;
+-		goto end;
+-	}
+-
+-	ret = drm_dp_read_desc(priv->aux, &desc, drm_dp_is_branch(dpcd));
+-	if (ret) {
+-		DRM_DEBUG_DP("failed to read desc\n");
+-		priv->plugged = false;
+-		goto end;
+-	}
+-
+-	status = connector_status_connected;
+-	priv->plugged = true;
+-
+-	if (drm_dp_read_sink_count_cap(connector, dpcd, &desc)) {
+-		int sink_count = drm_dp_read_sink_count(priv->aux);
+-
+-		drm_dbg_dp(dp->drm_dev, "sink_count = %d\n", sink_count);
+-
+-		if (sink_count <= 0)
+-			status = connector_status_disconnected;
+-	}
+-
+-end:
+-	/*
+-	 * If we detected the DPRX, leave the controller on so that it doesn't
+-	 * lose the state.
+-	 */
+-	if (!priv->plugged) {
+-		if (phy_deinit) {
+-			msm_dp_aux_enable_xfers(priv->aux, false);
+-			msm_dp_display_host_phy_exit(priv);
+-		}
+-
+-		pm_runtime_put_sync(&dp->pdev->dev);
+-	}
+-
+-	return status;
++	return priv->plugged ? connector_status_connected : connector_status_disconnected;
+ }
+ 
+ static irqreturn_t msm_dp_display_irq_handler(int irq, void *dev_id)
+-- 
+2.56.0
+
+
+From 15a5e7599cecfab88dcfd86e4ef4fbaab77e16fe Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Mon, 5 Oct 2026 11:40:10 -0300
+Subject: [PATCH 11/28] usb: typec: ucsi: do not set mux mode to plain usb when
+ altmode is present
+
+Fix regression introduced in 226ff2e
+where the condition was changed from if only FLAG_USB is present, to if
+FLAG_USB is present at all, ignoring the state of FLAG_ALT_MODE.
+---
+ drivers/usb/typec/ucsi/ucsi.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/typec/ucsi/ucsi.c b/drivers/usb/typec/ucsi/ucsi.c
+index c1450639c795..743c6f5f8fd5 100644
+--- a/drivers/usb/typec/ucsi/ucsi.c
++++ b/drivers/usb/typec/ucsi/ucsi.c
+@@ -1356,7 +1356,8 @@ static void ucsi_partner_change(struct ucsi_connector *con)
+ 			typec_set_mode(con->port, TYPEC_MODE_AUDIO);
+ 			break;
+ 		default:
+-			if (UCSI_CONSTAT(con, PARTNER_FLAG_USB))
++			if (UCSI_CONSTAT(con, PARTNER_FLAG_USB) &&
++			    !UCSI_CONSTAT(con, PARTNER_FLAG_ALT_MODE))
+ 				typec_set_mode(con->port, TYPEC_STATE_USB);
+ 		}
+ 
+-- 
+2.56.0
+
+
+From 2c4fdcd86223af25f9f38f76d0f493b5217a5ae0 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 6 Oct 2026 02:45:16 -0300
+Subject: [PATCH 12/28] soc: qcom: pmic_glink: avoid repeated disconnect hpd
+ notify
+
+---
+ drivers/soc/qcom/pmic_glink_altmode.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/qcom/pmic_glink_altmode.c b/drivers/soc/qcom/pmic_glink_altmode.c
+index 465e5d2316a0..147e7aaa3d29 100644
+--- a/drivers/soc/qcom/pmic_glink_altmode.c
++++ b/drivers/soc/qcom/pmic_glink_altmode.c
+@@ -111,6 +111,8 @@ struct pmic_glink_altmode_port {
+ 
+ 	struct work_struct work;
+ 
++	enum drm_connector_status conn_status;
++
+ 	struct auxiliary_device *bridge;
+ 
+ 	enum typec_orientation orientation;
+@@ -346,6 +348,17 @@ static void pmic_glink_altmode_safe(struct pmic_glink_altmode *altmode,
+ 		dev_err(altmode->dev, "failed to setup retimer to USB: %d\n", ret);
+ }
+ 
++static void pmic_glink_altmode_port_set_conn_status(struct pmic_glink_altmode_port *alt_port,
++						    enum drm_connector_status conn_status)
++{
++	/* Avoid repeated disconnect notify */
++	if (conn_status == alt_port->conn_status &&
++	    conn_status == connector_status_disconnected)
++		return;
++	alt_port->conn_status = conn_status;
++	drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
++}
++
+ static void pmic_glink_altmode_worker(struct work_struct *work)
+ {
+ 	struct pmic_glink_altmode_port *alt_port = work_to_altmode_port(work);
+@@ -374,7 +387,7 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
+ 		else
+ 			conn_status = connector_status_disconnected;
+ 
+-		drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
++		pmic_glink_altmode_port_set_conn_status(alt_port, conn_status);
+ 	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
+ 		if (alt_port->svid == USB_TYPEC_TBT_SID)
+ 			pmic_glink_altmode_enable_tbt(altmode, alt_port);
+-- 
+2.56.0
+
+
+From 193e84df8bdbcfe2030237927c8b512b1b0ae266 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 6 Oct 2026 02:46:14 -0300
+Subject: [PATCH 13/28] soc: qcom: pmic_glink: Add spinlock to guard altmode
+ port data
+
+Place altmode port data in a separate struct.
+---
+ drivers/soc/qcom/pmic_glink_altmode.c | 122 +++++++++++++++++---------
+ 1 file changed, 80 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/soc/qcom/pmic_glink_altmode.c b/drivers/soc/qcom/pmic_glink_altmode.c
+index 147e7aaa3d29..1f6345c76d65 100644
+--- a/drivers/soc/qcom/pmic_glink_altmode.c
++++ b/drivers/soc/qcom/pmic_glink_altmode.c
+@@ -97,6 +97,17 @@ struct pmic_glink_altmode;
+ 
+ #define work_to_altmode_port(w) container_of((w), struct pmic_glink_altmode_port, work)
+ 
++struct pmic_glink_altmode_port_data {
++	enum typec_orientation orientation;
++	u16 svid;
++	struct usbc_sc8280x_tbt_data tbt_data;
++	u8 dp_data;
++	u8 mode;
++	u8 hpd_state;
++	u8 hpd_irq;
++	u8 mux_ctrl;
++};
++
+ struct pmic_glink_altmode_port {
+ 	struct pmic_glink_altmode *altmode;
+ 	unsigned int index;
+@@ -109,20 +120,14 @@ struct pmic_glink_altmode_port {
+ 	struct typec_altmode dp_alt;
+ 	struct typec_altmode tbt_alt;
+ 
++	spinlock_t work_irq_lock;
+ 	struct work_struct work;
+ 
+ 	enum drm_connector_status conn_status;
+ 
+ 	struct auxiliary_device *bridge;
+ 
+-	enum typec_orientation orientation;
+-	u16 svid;
+-	struct usbc_sc8280x_tbt_data tbt_data;
+-	u8 dp_data;
+-	u8 mode;
+-	u8 hpd_state;
+-	u8 hpd_irq;
+-	u8 mux_ctrl;
++	struct pmic_glink_altmode_port_data data;
+ };
+ 
+ #define work_to_altmode(w) container_of((w), struct pmic_glink_altmode, enable_work)
+@@ -209,9 +214,10 @@ static void pmic_glink_altmode_enable_dp(struct pmic_glink_altmode *altmode,
+ }
+ 
+ static void pmic_glink_altmode_enable_tbt(struct pmic_glink_altmode *altmode,
+-					  struct pmic_glink_altmode_port *port)
++					  struct pmic_glink_altmode_port *port,
++					  struct usbc_sc8280x_tbt_data *tbt,
++					  u8 mode)
+ {
+-	struct usbc_sc8280x_tbt_data *tbt = &port->tbt_data;
+ 	struct typec_thunderbolt_data tbt_data = {};
+ 	u32 cable_speed;
+ 	int ret;
+@@ -251,7 +257,7 @@ static void pmic_glink_altmode_enable_tbt(struct pmic_glink_altmode *altmode,
+ 
+ 	port->state.alt = &port->tbt_alt;
+ 	port->state.data = &tbt_data;
+-	port->state.mode = TYPEC_MODAL_STATE(port->mode);
++	port->state.mode = TYPEC_MODAL_STATE(mode);
+ 
+ 	ret = typec_mux_set(port->typec_mux, &port->state);
+ 	if (ret)
+@@ -259,7 +265,7 @@ static void pmic_glink_altmode_enable_tbt(struct pmic_glink_altmode *altmode,
+ 
+ 	port->retimer_state.alt = &port->tbt_alt;
+ 	port->retimer_state.data = &tbt_data;
+-	port->retimer_state.mode = TYPEC_MODAL_STATE(port->mode);
++	port->retimer_state.mode = TYPEC_MODAL_STATE(mode);
+ 
+ 	ret = typec_retimer_set(port->typec_retimer, &port->retimer_state);
+ 	if (ret)
+@@ -267,9 +273,9 @@ static void pmic_glink_altmode_enable_tbt(struct pmic_glink_altmode *altmode,
+ }
+ 
+ static void pmic_glink_altmode_enable_usb4(struct pmic_glink_altmode *altmode,
+-					   struct pmic_glink_altmode_port *port)
++					   struct pmic_glink_altmode_port *port,
++					   struct usbc_sc8280x_tbt_data *tbt)
+ {
+-	struct usbc_sc8280x_tbt_data *tbt = &port->tbt_data;
+ 	struct enter_usb_data data = {};
+ 	int ret;
+ 
+@@ -359,47 +365,64 @@ static void pmic_glink_altmode_port_set_conn_status(struct pmic_glink_altmode_po
+ 	drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
+ }
+ 
++static void pmic_glink_alt_port_worker_get_data(struct pmic_glink_altmode_port *alt_port,
++						struct pmic_glink_altmode_port_data *alt_data)
++{
++	unsigned long flags;
++	spin_lock_irqsave(&alt_port->work_irq_lock, flags);
++	*alt_data = alt_port->data;
++	spin_unlock_irqrestore(&alt_port->work_irq_lock, flags);
++}
++
+ static void pmic_glink_altmode_worker(struct work_struct *work)
+ {
+ 	struct pmic_glink_altmode_port *alt_port = work_to_altmode_port(work);
+ 	struct pmic_glink_altmode *altmode = alt_port->altmode;
++	struct pmic_glink_altmode_port_data alt_data;
+ 	enum drm_connector_status conn_status;
+ 
+-	typec_switch_set(alt_port->typec_switch, alt_port->orientation);
++	pmic_glink_alt_port_worker_get_data(alt_port, &alt_data);
++
++	typec_switch_set(alt_port->typec_switch, alt_data.orientation);
+ 
+ 	/*
+ 	 * MUX_CTRL_STATE_DP4LN/USB3_DP may only be set if SVID=DP, but we need
+ 	 * to special-case the SVID=DP && mux_ctrl=NO_CONN case to deliver a
+ 	 * HPD notification
+ 	 */
+-	if (alt_port->svid == USB_TYPEC_DP_SID) {
+-		if (alt_port->mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
++	if (alt_data.svid == USB_TYPEC_DP_SID) {
++		if (alt_data.mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
+ 			pmic_glink_altmode_safe(altmode, alt_port);
+ 		} else {
+ 			pmic_glink_altmode_enable_dp(altmode, alt_port,
+-						     alt_port->mode,
+-						     alt_port->hpd_state,
+-						     alt_port->hpd_irq);
++						     alt_data.mode,
++						     alt_data.hpd_state,
++						     alt_data.hpd_irq);
+ 		}
+ 
+-		if (alt_port->hpd_state)
++		if (alt_data.hpd_state)
+ 			conn_status = connector_status_connected;
+ 		else
+ 			conn_status = connector_status_disconnected;
+ 
+ 		pmic_glink_altmode_port_set_conn_status(alt_port, conn_status);
+-	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
+-		if (alt_port->svid == USB_TYPEC_TBT_SID)
+-			pmic_glink_altmode_enable_tbt(altmode, alt_port);
++	} else if (alt_data.mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
++		if (alt_data.svid == USB_TYPEC_TBT_SID)
++			pmic_glink_altmode_enable_tbt(altmode,
++						      alt_port,
++						      &alt_data.tbt_data,
++						      alt_data.mode);
+ 		else
+-			pmic_glink_altmode_enable_usb4(altmode, alt_port);
+-	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_USB3_ONLY) {
++			pmic_glink_altmode_enable_usb4(altmode,
++						       alt_port,
++						       &alt_data.tbt_data);
++	} else if (alt_data.mux_ctrl == MUX_CTRL_STATE_USB3_ONLY) {
+ 		pmic_glink_altmode_enable_usb(altmode, alt_port);
+-	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
++	} else if (alt_data.mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
+ 		pmic_glink_altmode_safe(altmode, alt_port);
+ 	} else {
+ 		dev_err(altmode->dev, "Got unknown mux_ctrl: %u on port %u, forcing safe mode\n",
+-			alt_port->mux_ctrl, alt_port->index);
++			alt_data.mux_ctrl, alt_port->index);
+ 		pmic_glink_altmode_safe(altmode, alt_port);
+ 	}
+ 
+@@ -423,10 +446,20 @@ static enum typec_orientation pmic_glink_altmode_orientation(unsigned int orient
+ #define SC8180X_HPD_STATE_MASK		0x40000000
+ #define SC8180X_HPD_IRQ_MASK		0x80000000
+ 
++static void pmic_glink_alt_port_irq_set_data(struct pmic_glink_altmode_port *alt_port,
++					     const struct pmic_glink_altmode_port_data *alt_data)
++{
++	unsigned long flags;
++	spin_lock_irqsave(&alt_port->work_irq_lock, flags);
++	alt_port->data = *alt_data;
++	spin_unlock_irqrestore(&alt_port->work_irq_lock, flags);
++}
++
+ static void pmic_glink_altmode_sc8180xp_notify(struct pmic_glink_altmode *altmode,
+ 					       const void *data, size_t len)
+ {
+ 	struct pmic_glink_altmode_port *alt_port;
++	struct pmic_glink_altmode_port_data alt_data = { };
+ 	const struct usbc_sc8180x_notify *msg;
+ 	u32 notification;
+ 	u8 orientation;
+@@ -458,12 +491,14 @@ static void pmic_glink_altmode_sc8180xp_notify(struct pmic_glink_altmode *altmod
+ 		return;
+ 	}
+ 
++	alt_data.orientation = pmic_glink_altmode_orientation(orientation);
++	alt_data.svid = svid;
++	alt_data.mode = mode;
++	alt_data.hpd_state = hpd_state;
++	alt_data.hpd_irq = hpd_irq;
++
+ 	alt_port = &altmode->ports[port];
+-	alt_port->orientation = pmic_glink_altmode_orientation(orientation);
+-	alt_port->svid = svid;
+-	alt_port->mode = mode;
+-	alt_port->hpd_state = hpd_state;
+-	alt_port->hpd_irq = hpd_irq;
++	pmic_glink_alt_port_irq_set_data(alt_port, &alt_data);
+ 	queue_work(system_freezable_wq, &alt_port->work);
+ }
+ 
+@@ -475,6 +510,7 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
+ 					       u16 svid, const void *data, size_t len)
+ {
+ 	struct pmic_glink_altmode_port *alt_port;
++	struct pmic_glink_altmode_port_data alt_data = { };
+ 	const struct usbc_sc8280x_tbt_data *tbt;
+ 	const struct usbc_sc8280x_dp_data *dp;
+ 	const struct usbc_notify *notify;
+@@ -497,24 +533,25 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
+ 		return;
+ 	}
+ 
+-	alt_port = &altmode->ports[port];
+-	alt_port->orientation = pmic_glink_altmode_orientation(orientation);
+-	alt_port->svid = svid;
+-	alt_port->mux_ctrl = notify->mux_ctrl;
++	alt_data.orientation = pmic_glink_altmode_orientation(orientation);
++	alt_data.svid = svid;
++	alt_data.mux_ctrl = notify->mux_ctrl;
+ 
+ 	if (svid == USB_TYPEC_DP_SID) {
+ 		dp = &notify->extended_data.dp;
+ 
+-		alt_port->mode = dp->pin_assignment - DPAM_HPD_A;
+-		alt_port->hpd_state = dp->hpd_state;
+-		alt_port->hpd_irq = dp->hpd_irq;
+-	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
++		alt_data.mode = dp->pin_assignment - DPAM_HPD_A;
++		alt_data.hpd_state = dp->hpd_state;
++		alt_data.hpd_irq = dp->hpd_irq;
++	} else if (alt_data.mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
+ 		/* Valid for both USB4 and TBT3 */
+ 		tbt = &notify->extended_data.tbt;
+ 
+-		alt_port->tbt_data = *tbt;
++		alt_data.tbt_data = *tbt;
+ 	}
+ 
++	alt_port = &altmode->ports[port];
++	pmic_glink_alt_port_irq_set_data(alt_port, &alt_data);
+ 	queue_work(system_freezable_wq, &alt_port->work);
+ }
+ 
+@@ -628,6 +665,7 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
+ 		alt_port = &altmode->ports[port];
+ 		alt_port->altmode = altmode;
+ 		alt_port->index = port;
++		spin_lock_init(&alt_port->work_irq_lock);
+ 		INIT_WORK(&alt_port->work, pmic_glink_altmode_worker);
+ 
+ 		alt_port->bridge = devm_drm_dp_hpd_bridge_alloc(dev, to_of_node(fwnode));
+-- 
+2.56.0
+
+
+From 23fa8a0e62c5b3104cbd64b937d1e003df6658a9 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 6 Oct 2026 02:34:25 -0300
+Subject: [PATCH 14/28] soc: qcom: pmic_glink: unplug dp display when ucsi
+ altmode is unset
+
+When altmode handshake fails (dp connection shows up as billboard device),
+no pmic event is generated, and the dp display is not unplugged.
+The dangling display may hang the device if modeset is attempted.
+
+ucsi will receive a connector_status event in such a scenario.
+Add plumbing to call hpd_notify with status disconnected in this case.
+---
+ drivers/soc/qcom/pmic_glink.c         |  7 +++++++
+ drivers/soc/qcom/pmic_glink_altmode.c | 24 ++++++++++++++++++++++++
+ drivers/usb/typec/ucsi/ucsi_glink.c   |  8 ++++++++
+ include/linux/soc/qcom/pmic_glink.h   |  3 +++
+ 4 files changed, 42 insertions(+)
+
+diff --git a/drivers/soc/qcom/pmic_glink.c b/drivers/soc/qcom/pmic_glink.c
+index 3042261578aa..380141f58aa0 100644
+--- a/drivers/soc/qcom/pmic_glink.c
++++ b/drivers/soc/qcom/pmic_glink.c
+@@ -118,6 +118,13 @@ void pmic_glink_client_register(struct pmic_glink_client *client)
+ }
+ EXPORT_SYMBOL_GPL(pmic_glink_client_register);
+ 
++void pmic_glink_noaltmode_notify(struct device *dev, unsigned port)
++{
++	struct pmic_glink *pg = dev_get_drvdata(dev);
++	pmic_glink_noaltmode_listener(&pg->altmode_aux, port);
++}
++EXPORT_SYMBOL_GPL(pmic_glink_noaltmode_notify);
++
+ int pmic_glink_send(struct pmic_glink_client *client, void *data, size_t len)
+ {
+ 	struct pmic_glink *pg = client->pg;
+diff --git a/drivers/soc/qcom/pmic_glink_altmode.c b/drivers/soc/qcom/pmic_glink_altmode.c
+index 1f6345c76d65..818aa1313d76 100644
+--- a/drivers/soc/qcom/pmic_glink_altmode.c
++++ b/drivers/soc/qcom/pmic_glink_altmode.c
+@@ -121,6 +121,7 @@ struct pmic_glink_altmode_port {
+ 	struct typec_altmode tbt_alt;
+ 
+ 	spinlock_t work_irq_lock;
++	struct mutex work_lock;
+ 	struct work_struct work;
+ 
+ 	enum drm_connector_status conn_status;
+@@ -381,6 +382,8 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
+ 	struct pmic_glink_altmode_port_data alt_data;
+ 	enum drm_connector_status conn_status;
+ 
++	guard(mutex)(&alt_port->work_lock);
++
+ 	pmic_glink_alt_port_worker_get_data(alt_port, &alt_data);
+ 
+ 	typec_switch_set(alt_port->typec_switch, alt_data.orientation);
+@@ -611,6 +614,25 @@ static void pmic_glink_altmode_pdr_notify(void *priv, int state)
+ 		schedule_work(&altmode->enable_work);
+ }
+ 
++void pmic_glink_noaltmode_listener(struct auxiliary_device *adev, unsigned port)
++{
++	struct pmic_glink_altmode *altmode = dev_get_drvdata(&adev->dev);
++	struct pmic_glink_altmode_port *alt_port;
++	struct pmic_glink_altmode_port_data alt_data = { };
++
++	if (port >= ARRAY_SIZE(altmode->ports) || !altmode->ports[port].altmode)
++		return;
++
++	alt_port = &altmode->ports[port];
++	guard(mutex)(&alt_port->work_lock);
++
++	/* reset data to safe */
++	pmic_glink_alt_port_irq_set_data(alt_port, &alt_data);
++
++	pmic_glink_altmode_port_set_conn_status(alt_port, connector_status_disconnected);
++}
++EXPORT_SYMBOL_GPL(pmic_glink_noaltmode_listener);
++
+ static const struct of_device_id pmic_glink_altmode_of_quirks[] = {
+ 	{ .compatible = "qcom,sc8180x-pmic-glink", .data = (void *)PMIC_GLINK_OWNER_USBC },
+ 	{}
+@@ -666,6 +688,7 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
+ 		alt_port->altmode = altmode;
+ 		alt_port->index = port;
+ 		spin_lock_init(&alt_port->work_irq_lock);
++		mutex_init(&alt_port->work_lock);
+ 		INIT_WORK(&alt_port->work, pmic_glink_altmode_worker);
+ 
+ 		alt_port->bridge = devm_drm_dp_hpd_bridge_alloc(dev, to_of_node(fwnode));
+@@ -747,6 +770,7 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
+ 		return PTR_ERR(altmode->client);
+ 
+ 	pmic_glink_client_register(altmode->client);
++	dev_set_drvdata(dev, altmode);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/usb/typec/ucsi/ucsi_glink.c b/drivers/usb/typec/ucsi/ucsi_glink.c
+index 1db0c88d817e..12a0a2a3ec9e 100644
+--- a/drivers/usb/typec/ucsi/ucsi_glink.c
++++ b/drivers/usb/typec/ucsi/ucsi_glink.c
+@@ -218,6 +218,14 @@ static void pmic_glink_ucsi_connector_status(struct ucsi_connector *con)
+ 	    !ucsi->port_orientation[con->num - 1])
+ 		return;
+ 
++	/* In case of altmode handshake failure, no pmic event is generated
++	 * and the dp display would dangle. Attempts to modeset will lead to
++	 * device hang.
++	 *
++	 * Manually disconnect the dp display by listening to ucsi event. */
++	if (!UCSI_CONSTAT(con, PARTNER_FLAG_ALT_MODE))
++		pmic_glink_noaltmode_notify(ucsi->dev->parent, con->num - 1);
++
+ 	orientation = gpiod_get_value(ucsi->port_orientation[con->num - 1]);
+ 	if (orientation >= 0) {
+ 		typec_set_orientation(con->port,
+diff --git a/include/linux/soc/qcom/pmic_glink.h b/include/linux/soc/qcom/pmic_glink.h
+index 7cddf1027752..d9bee3d03777 100644
+--- a/include/linux/soc/qcom/pmic_glink.h
++++ b/include/linux/soc/qcom/pmic_glink.h
+@@ -30,4 +30,7 @@ struct pmic_glink_client *devm_pmic_glink_client_alloc(struct device *dev,
+ 						       void *priv);
+ void pmic_glink_client_register(struct pmic_glink_client *client);
+ 
++void pmic_glink_noaltmode_listener(struct auxiliary_device *adev, unsigned port);
++void pmic_glink_noaltmode_notify(struct device *dev, unsigned port);
++
+ #endif
+-- 
+2.56.0
+
+
+From e395338887b969318883110459e03eb1ac50e75c Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Mon, 5 Oct 2026 12:27:47 -0300
+Subject: [PATCH 15/28] drm/msm/dp: prevent repeated phy_power_on of dp phy in
+ case of error
+
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index abd3dcdad03c..0848167c66a5 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -1887,8 +1887,10 @@ static int msm_dp_ctrl_enable_mainlink_clocks(struct msm_dp_ctrl_private *ctrl,
+ 
+ 	dev_pm_opp_set_rate(ctrl->dev, ctrl->link->link_params.rate * 1000);
+ 	ret = msm_dp_ctrl_link_clk_enable(&ctrl->msm_dp_ctrl);
+-	if (ret)
++	if (ret) {
+ 		DRM_ERROR("Unable to start link clocks. ret=%d\n", ret);
++		phy_power_off(phy);
++	}
+ 
+ 	drm_dbg_dp(ctrl->drm_dev, "link rate=%d\n", ctrl->link->link_params.rate);
+ 
+@@ -2415,9 +2417,11 @@ int msm_dp_ctrl_on_link(struct msm_dp_ctrl *msm_dp_ctrl,
+ 		ctrl->link->link_params.rate, ctrl->link->link_params.num_lanes,
+ 		pixel_rate);
+ 
+-	rc = msm_dp_ctrl_enable_mainlink_clocks(ctrl, panel);
+-	if (rc)
+-		return rc;
++	if (!ctrl->link_clks_on) { /* link clk is off */
++		rc = msm_dp_ctrl_enable_mainlink_clocks(ctrl, panel);
++		if (rc)
++			return rc;
++	}
+ 
+ 	while (--link_train_max_retries) {
+ 		training_step = DP_TRAINING_NONE;
+-- 
+2.56.0
+
+
+From 1c683d035934c524cfb49c1b3022a3154ce1c2a8 Mon Sep 17 00:00:00 2001
+From: Xi Zhang <xz.ca.cn@gmail.com>
+Date: Wed, 28 Oct 2026 12:02:44 -0300
+Subject: [PATCH 16/28] drm/msm/dp: dp display mutex guard reorganize - place
+ guard on entry points
+
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index d543999ce586..a1c73c8d3b4a 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -415,8 +415,6 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 			dp->msm_dp_display.connector_type,
+ 			dp->link->sink_count);
+ 
+-	guard(mutex)(&dp->plugged_lock);
+-
+ 	if (!dp->plugged) {
+ 		ret = pm_runtime_resume_and_get(&pdev->dev);
+ 		if (ret) {
+@@ -458,8 +456,6 @@ static int msm_dp_hpd_unplug_handle(struct msm_dp_display_private *dp)
+ {
+ 	struct platform_device *pdev = dp->msm_dp_display.pdev;
+ 
+-	guard(mutex)(&dp->plugged_lock);
+-
+ 	dp->panel->video_test = false;
+ 
+ 	msm_dp_aux_enable_xfers(dp->aux, false);
+@@ -1399,6 +1395,8 @@ void msm_dp_display_atomic_pre_enable(struct msm_dp *msm_dp_display,
+ 
+ 	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+ 
++	guard(mutex)(&dp->plugged_lock);
++
+ 	crtc = drm_atomic_get_new_crtc_for_encoder(state, msm_dp_display->bridge->encoder);
+ 	if (!crtc)
+ 		return;
+@@ -1420,6 +1418,8 @@ void msm_dp_display_atomic_enable(struct msm_dp *msm_dp_display,
+ 
+ 	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+ 
++	guard(mutex)(&dp->plugged_lock);
++
+ 	rc = msm_dp_display_prepare_link(dp);
+ 	if (rc) {
+ 		DRM_ERROR("DP display prepare failed, rc=%d\n", rc);
+@@ -1445,6 +1445,8 @@ void msm_dp_display_atomic_disable(struct msm_dp *dp)
+ 
+ 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 
++	guard(mutex)(&msm_dp_display->plugged_lock);
++
+ 	/*
+ 	 * If .atomic_enable() bailed out - link training failure is the common
+ 	 * case - the mainlink was never brought up and ->power_on stayed false.
+@@ -1491,6 +1493,8 @@ void msm_dp_display_atomic_post_disable(struct msm_dp *dp)
+ 
+ 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 
++	guard(mutex)(&msm_dp_display->plugged_lock);
++
+ 	if (dp->is_edp)
+ 		msm_dp_hpd_unplug_handle(msm_dp_display);
+ 
+@@ -1545,6 +1549,8 @@ void msm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
+ 	struct msm_dp_display_private *dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+ 	u32 hpd_link_status = 0;
+ 
++	guard(mutex)(&dp->plugged_lock);
++
+ 	if (pm_runtime_resume_and_get(&msm_dp_display->pdev->dev)) {
+ 		DRM_ERROR("failed to pm_runtime_resume\n");
+ 		return;
+-- 
+2.56.0
+
+
+From 97bf47ed36b4fcdd687621baa09a91eee6f26034 Mon Sep 17 00:00:00 2001
+From: Xi Zhang <xz.ca.cn@gmail.com>
+Date: Wed, 28 Oct 2026 12:14:37 -0300
+Subject: [PATCH 17/28] drm/msm/dp: retry hpd after errors such as link train
+ failure
+
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 55 ++++++++++++++++++++++++++---
+ 1 file changed, 51 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index a1c73c8d3b4a..95dac8e8a31b 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -55,6 +55,8 @@ struct msm_dp_display_private {
+ 
+ 	struct mutex plugged_lock;
+ 	bool plugged;
++	bool plugged_connected;
++	struct work_struct plugged_retry_work;
+ 
+ 	struct drm_device *drm_dev;
+ 
+@@ -415,6 +417,9 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 			dp->msm_dp_display.connector_type,
+ 			dp->link->sink_count);
+ 
++	if (dp->plugged_connected)
++		return 0;
++
+ 	if (!dp->plugged) {
+ 		ret = pm_runtime_resume_and_get(&pdev->dev);
+ 		if (ret) {
+@@ -435,6 +440,8 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 			dp->msm_dp_display.connector_type,
+ 			dp->link->sink_count);
+ 
++	dp->plugged_connected = !ret;
++
+ 	return ret;
+ };
+ 
+@@ -472,7 +479,7 @@ static int msm_dp_hpd_unplug_handle(struct msm_dp_display_private *dp)
+ 		drm_edid_connector_update(dp->msm_dp_display.connector, NULL);
+ 
+ 	/* triggered by irq_hdp with sink_count = 0 */
+-	if (dp->link->sink_count == 0)
++	if (!dp->msm_dp_display.power_on)
+ 		msm_dp_display_host_phy_exit(dp);
+ 
+ 	/*
+@@ -497,6 +504,8 @@ static int msm_dp_hpd_unplug_handle(struct msm_dp_display_private *dp)
+ 		dp->plugged = false;
+ 	}
+ 
++	dp->plugged_connected = false;
++
+ 	return 0;
+ }
+ 
+@@ -904,7 +913,34 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
+ 	priv = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 
+ 	guard(mutex)(&priv->plugged_lock);
+-	return priv->plugged ? connector_status_connected : connector_status_disconnected;
++
++	/* Retry for plug_handle fail, or for plugged_retry_work_fn. */
++	if (priv->plugged && !priv->plugged_connected) {
++		msm_dp_hpd_plug_handle(priv);
++		if (!priv->plugged_connected) {
++			msm_dp_hpd_unplug_handle(priv);
++			/* Resend event for status_disconnected */
++			schedule_work(&priv->plugged_retry_work);
++		}
++	}
++
++	return priv->plugged_connected ? connector_status_connected : connector_status_disconnected;
++}
++
++static void msm_dp_display_plugged_retry_work_fn(struct work_struct *work)
++{
++	struct msm_dp_display_private *msm_dp_display = container_of(work,
++								     typeof(*msm_dp_display),
++								     plugged_retry_work);
++	struct msm_dp *dp = &msm_dp_display->msm_dp_display;
++
++	guard(mutex)(&msm_dp_display->plugged_lock);
++
++	mutex_lock(&dp->drm_dev->mode_config.mutex);
++	drm_connector_set_link_status_property(dp->connector, DRM_MODE_LINK_STATUS_BAD);
++	mutex_unlock(&dp->drm_dev->mode_config.mutex);
++
++	drm_kms_helper_connector_hotplug_event(dp->connector);
+ }
+ 
+ static irqreturn_t msm_dp_display_irq_handler(int irq, void *dev_id)
+@@ -1199,6 +1235,8 @@ static int msm_dp_display_probe(struct platform_device *pdev)
+ 	dp->hpd_isr_status = 0;
+ 
+ 	mutex_init(&dp->plugged_lock);
++	INIT_WORK(&dp->plugged_retry_work,
++		  msm_dp_display_plugged_retry_work_fn);
+ 
+ 	rc = msm_dp_display_get_io(dp);
+ 	if (rc)
+@@ -1423,20 +1461,29 @@ void msm_dp_display_atomic_enable(struct msm_dp *msm_dp_display,
+ 	rc = msm_dp_display_prepare_link(dp);
+ 	if (rc) {
+ 		DRM_ERROR("DP display prepare failed, rc=%d\n", rc);
+-		return;
++		goto end;
+ 	}
+ 
+ 	rc = msm_dp_display_enable(dp, dp->panel);
+-	if (rc)
++	if (rc) {
+ 		DRM_ERROR("DP display enable failed, rc=%d\n", rc);
++		goto end;
++	}
+ 
+ 	rc = msm_dp_display_post_enable(msm_dp_display);
+ 	if (rc) {
+ 		DRM_ERROR("DP display post enable failed, rc=%d\n", rc);
+ 		msm_dp_display_disable(dp, dp->panel);
++		goto end;
+ 	}
+ 
+ 	drm_dbg_dp(msm_dp_display->drm_dev, "type=%d Done\n", msm_dp_display->connector_type);
++
++end:
++	if (rc) {
++		dp->plugged_connected = false;
++		schedule_work(&dp->plugged_retry_work);
++	}
+ }
+ 
+ void msm_dp_display_atomic_disable(struct msm_dp *dp)
+-- 
+2.56.0
+
+
+From f34385de7864b9fcc3ef55bafba30821ce4bae1f Mon Sep 17 00:00:00 2001
+From: Xi Zhang <xz.ca.cn@gmail.com>
+Date: Wed, 28 Oct 2026 12:22:56 -0300
+Subject: [PATCH 18/28] drm/msm/dp: fix race between (un)plug_handle and
+ display_(enable|disable)
+
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 28 ++++++++++++++++++++++++++--
+ 1 file changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 95dac8e8a31b..e8527e0ce313 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -56,6 +56,8 @@ struct msm_dp_display_private {
+ 	struct mutex plugged_lock;
+ 	bool plugged;
+ 	bool plugged_connected;
++	bool plugged_disconnecting;
++	bool plugged_reconnecting;
+ 	struct work_struct plugged_retry_work;
+ 
+ 	struct drm_device *drm_dev;
+@@ -434,6 +436,11 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 		dp->plugged = true;
+ 	}
+ 
++	if (dp->plugged_disconnecting) {
++		dp->plugged_reconnecting = true;
++		return 0;
++	}
++
+ 	ret = msm_dp_display_process_hpd_high(dp);
+ 
+ 	drm_dbg_dp(dp->drm_dev, "After, type=%d sink_count=%d\n",
+@@ -481,6 +488,11 @@ static int msm_dp_hpd_unplug_handle(struct msm_dp_display_private *dp)
+ 	/* triggered by irq_hdp with sink_count = 0 */
+ 	if (!dp->msm_dp_display.power_on)
+ 		msm_dp_display_host_phy_exit(dp);
++	else {
++		/* delay reconnect for next plug_handle until display_disable to avoid race */
++		dp->plugged_disconnecting = true;
++		dp->plugged_reconnecting = false;
++	}
+ 
+ 	/*
+ 	 * We don't need separate work for disconnect as
+@@ -1448,6 +1460,7 @@ void msm_dp_display_atomic_pre_enable(struct msm_dp *msm_dp_display,
+ 	msm_dp_display_set_mode(msm_dp_display, &crtc_state->adjusted_mode, dp->panel);
+ }
+ 
++static void msm_dp_display_unprepare(struct msm_dp_display_private *dp);
+ void msm_dp_display_atomic_enable(struct msm_dp *msm_dp_display,
+ 				  struct drm_atomic_commit *state)
+ {
+@@ -1474,6 +1487,7 @@ void msm_dp_display_atomic_enable(struct msm_dp *msm_dp_display,
+ 	if (rc) {
+ 		DRM_ERROR("DP display post enable failed, rc=%d\n", rc);
+ 		msm_dp_display_disable(dp, dp->panel);
++		msm_dp_display_unprepare(dp);
+ 		goto end;
+ 	}
+ 
+@@ -1516,12 +1530,12 @@ static void msm_dp_display_unprepare(struct msm_dp_display_private *dp)
+ 	struct msm_dp *msm_dp_display = &dp->msm_dp_display;
+ 
+ 	/* dongle is still connected but sinks are disconnected */
+-	if (dp->link->sink_count == 0)
++	if (!dp->plugged_disconnecting)
+ 		msm_dp_link_psm_config(dp->link, &dp->panel->link_info, true);
+ 
+ 	msm_dp_ctrl_off_link(dp->ctrl, dp->panel);
+ 
+-	if (dp->link->sink_count == 0)
++	if (!dp->plugged_disconnecting)
+ 		/* re-init the PHY so that we can listen to Dongle disconnect */
+ 		msm_dp_ctrl_reinit_phy(dp->ctrl);
+ 	else
+@@ -1529,6 +1543,16 @@ static void msm_dp_display_unprepare(struct msm_dp_display_private *dp)
+ 
+ 	msm_dp_display->power_on = false;
+ 
++	dp->plugged_disconnecting = false;
++	if (dp->plugged_reconnecting) {
++		dp->plugged_reconnecting = false;
++
++		/* call plug_handle explicitly instead of relying on bridge_detect */
++		msm_dp_hpd_plug_handle(dp);
++
++		schedule_work(&dp->plugged_retry_work);
++	}
++
+ 	pm_runtime_put_sync(&msm_dp_display->pdev->dev);
+ 
+ 	drm_dbg_dp(dp->drm_dev, "type=%d Done\n", msm_dp_display->connector_type);
+-- 
+2.56.0
+
+
+From 1ed3305463b69944fd2d4795a2986a910e9221ca Mon Sep 17 00:00:00 2001
+From: Xi Zhang <xz.ca.cn@gmail.com>
+Date: Wed, 28 Oct 2026 12:34:14 -0300
+Subject: [PATCH 19/28] drm/msm/dp: re-add atomic_check for reliability, and
+ re-add check in get_modes
+
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 36 +++++++++++++++++++++++------
+ drivers/gpu/drm/msm/dp/dp_display.h |  1 -
+ drivers/gpu/drm/msm/dp/dp_drm.c     | 28 +---------------------
+ drivers/gpu/drm/msm/dp/dp_drm.h     |  5 ++++
+ 4 files changed, 35 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index e8527e0ce313..dae008acd9ff 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -816,18 +816,23 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
+ 	return MODE_OK;
+ }
+ 
+-int msm_dp_display_get_modes(struct msm_dp *dp)
++int msm_dp_bridge_get_modes(struct drm_bridge *bridge, struct drm_connector *connector)
+ {
+-	struct msm_dp_display_private *msm_dp_display;
++	struct msm_dp *msm_dp_display;
++	struct msm_dp_display_private *dp;
+ 
+-	if (!dp) {
+-		DRM_ERROR("invalid params\n");
++	if (!connector)
+ 		return 0;
+-	}
+ 
+-	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
++	msm_dp_display = to_dp_bridge(bridge)->msm_dp_display;
++	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+ 
+-	return drm_edid_connector_add_modes(msm_dp_display->panel->connector);
++	if (dp->plugged_connected) {
++		return drm_edid_connector_add_modes(dp->panel->connector);
++	} else {
++		drm_dbg_dp(connector->dev, "No sink connected\n");
++	}
++	return 0;
+ }
+ 
+ bool msm_dp_display_check_video_test(struct msm_dp *dp)
+@@ -904,6 +909,23 @@ void msm_dp_display_set_psr(struct msm_dp *msm_dp_display, bool enter)
+ 	msm_dp_ctrl_set_psr(dp->ctrl, dp->panel, enter);
+ }
+ 
++int msm_dp_bridge_atomic_check(struct drm_bridge *bridge,
++			       struct drm_bridge_state *bridge_state,
++			       struct drm_crtc_state *crtc_state,
++			       struct drm_connector_state *conn_state)
++{
++	struct msm_dp *msm_dp_display;
++	struct msm_dp_display_private *dp;
++
++	msm_dp_display = to_dp_bridge(bridge)->msm_dp_display;
++	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
++
++	if (bridge->ops & DRM_BRIDGE_OP_HPD)
++		return dp->plugged_connected ? 0 : -ENOTCONN;
++
++	return 0;
++}
++
+ /**
+  * msm_dp_bridge_detect - callback to determine if connector is connected
+  *
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.h b/drivers/gpu/drm/msm/dp/dp_display.h
+index 83117e7619f3..8d12db49b253 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.h
++++ b/drivers/gpu/drm/msm/dp/dp_display.h
+@@ -26,7 +26,6 @@ struct msm_dp {
+ 	bool psr_supported;
+ };
+ 
+-int msm_dp_display_get_modes(struct msm_dp *msm_dp_display);
+ bool msm_dp_display_check_video_test(struct msm_dp *msm_dp_display);
+ int msm_dp_display_get_test_bpp(struct msm_dp *msm_dp_display);
+ void msm_dp_display_signal_audio_start(struct msm_dp *msm_dp_display);
+diff --git a/drivers/gpu/drm/msm/dp/dp_drm.c b/drivers/gpu/drm/msm/dp/dp_drm.c
+index 5e9ad6430038..99e9f717ed9f 100644
+--- a/drivers/gpu/drm/msm/dp/dp_drm.c
++++ b/drivers/gpu/drm/msm/dp/dp_drm.c
+@@ -15,33 +15,6 @@
+ #include "dp_audio.h"
+ #include "dp_drm.h"
+ 
+-/**
+- * msm_dp_bridge_get_modes - callback to add drm modes via drm_mode_probed_add()
+- * @bridge: Poiner to drm bridge
+- * @connector: Pointer to drm connector structure
+- * Returns: Number of modes added
+- */
+-static int msm_dp_bridge_get_modes(struct drm_bridge *bridge, struct drm_connector *connector)
+-{
+-	int rc = 0;
+-	struct msm_dp *dp;
+-
+-	if (!connector)
+-		return 0;
+-
+-	dp = to_dp_bridge(bridge)->msm_dp_display;
+-
+-	/* pluggable case assumes EDID is read when HPD */
+-	rc = msm_dp_display_get_modes(dp);
+-	if (rc <= 0) {
+-		DRM_ERROR("failed to get DP sink modes, rc=%d\n", rc);
+-		return rc;
+-	} else {
+-		drm_dbg_dp(connector->dev, "No sink connected\n");
+-	}
+-	return rc;
+-}
+-
+ static void msm_dp_bridge_debugfs_init(struct drm_bridge *bridge, struct dentry *root)
+ {
+ 	struct msm_dp *dp = to_dp_bridge(bridge)->msm_dp_display;
+@@ -105,6 +78,7 @@ static const struct drm_bridge_funcs msm_dp_bridge_ops = {
+ 	.atomic_post_disable    = msm_dp_bridge_atomic_post_disable,
+ 	.mode_valid   = msm_dp_bridge_mode_valid,
+ 	.get_modes    = msm_dp_bridge_get_modes,
++	.atomic_check = msm_dp_bridge_atomic_check,
+ 	.detect       = msm_dp_bridge_detect,
+ 	.hpd_enable   = msm_dp_bridge_hpd_enable,
+ 	.hpd_disable  = msm_dp_bridge_hpd_disable,
+diff --git a/drivers/gpu/drm/msm/dp/dp_drm.h b/drivers/gpu/drm/msm/dp/dp_drm.h
+index da412c788503..b9cdb913df39 100644
+--- a/drivers/gpu/drm/msm/dp/dp_drm.h
++++ b/drivers/gpu/drm/msm/dp/dp_drm.h
+@@ -25,6 +25,11 @@ int msm_dp_bridge_init(struct msm_dp *msm_dp_display, struct drm_device *dev,
+ 		   struct drm_encoder *encoder,
+ 		   bool yuv_supported);
+ 
++int msm_dp_bridge_get_modes(struct drm_bridge *bridge, struct drm_connector *connector);
++int msm_dp_bridge_atomic_check(struct drm_bridge *bridge,
++			       struct drm_bridge_state *bridge_state,
++			       struct drm_crtc_state *crtc_state,
++			       struct drm_connector_state *conn_state);
+ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
+ 					       struct drm_connector *connector);
+ void msm_dp_bridge_hpd_enable(struct drm_bridge *bridge);
+-- 
+2.56.0
+
+
+From ca28b774101d51c5f4d5b5664a564aab2a4a5aec Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 6 Oct 2026 03:03:35 -0300
+Subject: [PATCH 20/28] soc: qcom: pmic_glink: set mux_ctrl for sc8180xp_notify
+
+Fix sc8180xp_notify regression introduced in 0539c5a where mux_ctrl
+became required for dp altmode set, but weren't set
+---
+ drivers/soc/qcom/pmic_glink_altmode.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/qcom/pmic_glink_altmode.c b/drivers/soc/qcom/pmic_glink_altmode.c
+index 818aa1313d76..ef4a3ab65b6e 100644
+--- a/drivers/soc/qcom/pmic_glink_altmode.c
++++ b/drivers/soc/qcom/pmic_glink_altmode.c
+@@ -469,9 +469,11 @@ static void pmic_glink_altmode_sc8180xp_notify(struct pmic_glink_altmode *altmod
+ 	u8 hpd_state;
+ 	u8 hpd_irq;
+ 	u16 svid;
++	u8 mux_ctrl;
+ 	u8 port;
+ 	u8 mode;
+ 	u8 mux;
++	u8 dp_mode;
+ 
+ 	if (len != sizeof(*msg)) {
+ 		dev_warn(altmode->dev, "invalid length of USBC_NOTIFY indication: %zd\n", len);
+@@ -487,7 +489,14 @@ static void pmic_glink_altmode_sc8180xp_notify(struct pmic_glink_altmode *altmod
+ 	hpd_state = FIELD_GET(SC8180X_HPD_STATE_MASK, notification);
+ 	hpd_irq = FIELD_GET(SC8180X_HPD_IRQ_MASK, notification);
+ 
+-	svid = mux == 2 ? USB_TYPEC_DP_SID : 0;
++	if (mux == 2) {
++		dp_mode = TYPEC_MODAL_STATE(mode);
++		svid = USB_TYPEC_DP_SID;
++		mux_ctrl = dp_mode == TYPEC_DP_STATE_D ? MUX_CTRL_STATE_USB3_DP : MUX_CTRL_STATE_DP4LN;
++	} else {
++		svid = 0;
++		mux_ctrl = MUX_CTRL_STATE_USB3_ONLY;
++	}
+ 
+ 	if (port >= ARRAY_SIZE(altmode->ports) || !altmode->ports[port].altmode) {
+ 		dev_dbg(altmode->dev, "notification on undefined port %d\n", port);
+-- 
+2.56.0
+
+
+From a01a29be1d94dcb714859573304274dbeebfb6a1 Mon Sep 17 00:00:00 2001
+From: Xi Zhang <xz.ca.cn@gmail.com>
+Date: Wed, 28 Oct 2026 12:57:17 -0300
+Subject: [PATCH 21/28] drm/msm/dp: turn off link if training error
+
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c    |  5 +++++
+ drivers/gpu/drm/msm/dp/dp_display.c | 10 +++++++---
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 0848167c66a5..524c87d8d2d4 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -1860,6 +1860,11 @@ static void msm_dp_ctrl_link_clk_disable(struct msm_dp_ctrl *msm_dp_ctrl)
+ 
+ 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
+ 
++	if (!ctrl->link_clks_on) {
++		drm_dbg_dp(ctrl->drm_dev, "links clks already disabled\n");
++		return;
++	}
++
+ 	clk_bulk_disable_unprepare(ctrl->num_link_clks, ctrl->link_clks);
+ 
+ 	ctrl->link_clks_on = false;
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index dae008acd9ff..630540f1724b 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -1482,7 +1482,6 @@ void msm_dp_display_atomic_pre_enable(struct msm_dp *msm_dp_display,
+ 	msm_dp_display_set_mode(msm_dp_display, &crtc_state->adjusted_mode, dp->panel);
+ }
+ 
+-static void msm_dp_display_unprepare(struct msm_dp_display_private *dp);
+ void msm_dp_display_atomic_enable(struct msm_dp *msm_dp_display,
+ 				  struct drm_atomic_commit *state)
+ {
+@@ -1508,8 +1507,6 @@ void msm_dp_display_atomic_enable(struct msm_dp *msm_dp_display,
+ 	rc = msm_dp_display_post_enable(msm_dp_display);
+ 	if (rc) {
+ 		DRM_ERROR("DP display post enable failed, rc=%d\n", rc);
+-		msm_dp_display_disable(dp, dp->panel);
+-		msm_dp_display_unprepare(dp);
+ 		goto end;
+ 	}
+ 
+@@ -1517,6 +1514,13 @@ void msm_dp_display_atomic_enable(struct msm_dp *msm_dp_display,
+ 
+ end:
+ 	if (rc) {
++		msm_dp_ctrl_off_pixel_clk(dp->ctrl, dp->panel->stream_id);
++		msm_dp_ctrl_off_link(dp->ctrl, dp->panel);
++
++		msm_dp_ctrl_reinit_phy(dp->ctrl);
++
++		msm_dp_display->power_on = false;
++
+ 		dp->plugged_connected = false;
+ 		schedule_work(&dp->plugged_retry_work);
+ 	}
+-- 
+2.56.0
+
+
+From bb784db7bc595fdee0b0a795c5af8285fda54889 Mon Sep 17 00:00:00 2001
+From: Xi Zhang <xz.ca.cn@gmail.com>
+Date: Sat, 31 Oct 2026 07:13:03 -0300
+Subject: [PATCH 22/28] drm/msm/dp: hoist psm_config and process_request to
+ parent functions
+
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 29 +++++++++++++++++------------
+ 1 file changed, 17 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 630540f1724b..c68e42890cd8 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -300,8 +300,6 @@ static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
+ 			return -ETIMEDOUT;
+ 	}
+ 
+-	msm_dp_link_process_request(dp->link);
+-
+ 	if (!dp->msm_dp_display.is_edp)
+ 		drm_dp_set_subconnector_property(connector,
+ 						 connector_status_connected,
+@@ -313,12 +311,6 @@ static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
+ 	dp->audio_supported = info->has_audio;
+ 	msm_dp_panel_handle_sink_request(dp->panel, drm_edid);
+ 
+-	/*
+-	 * set sink to normal operation mode -- D0
+-	 * before dpcd read
+-	 */
+-	msm_dp_link_psm_config(dp->link, &dp->panel->link_info, false);
+-
+ 	msm_dp_link_reset_phy_params_vx_px(dp->link);
+ 
+ end:
+@@ -441,12 +433,21 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 		return 0;
+ 	}
+ 
++	ret = msm_dp_link_psm_config(dp->link, &dp->panel->link_info, false);
++	if (ret)
++		goto end;
++
++	ret = msm_dp_link_process_request(dp->link);
++	if (ret)
++		goto end;
++
+ 	ret = msm_dp_display_process_hpd_high(dp);
+ 
+ 	drm_dbg_dp(dp->drm_dev, "After, type=%d sink_count=%d\n",
+ 			dp->msm_dp_display.connector_type,
+ 			dp->link->sink_count);
+ 
++end:
+ 	dp->plugged_connected = !ret;
+ 
+ 	return ret;
+@@ -533,6 +534,10 @@ static int msm_dp_irq_hpd_handle(struct msm_dp_display_private *dp)
+ 			dp->msm_dp_display.connector_type,
+ 			dp->link->sink_count);
+ 
++	rc = msm_dp_link_psm_config(dp->link, &dp->panel->link_info, false);
++	if (rc)
++		goto end;
++
+ 	/* check for any test request issued by sink */
+ 	rc = msm_dp_link_process_request(dp->link);
+ 	if (!rc) {
+@@ -548,6 +553,9 @@ static int msm_dp_irq_hpd_handle(struct msm_dp_display_private *dp)
+ 			dp->msm_dp_display.connector_type,
+ 			dp->link->sink_count);
+ 
++end:
++	dp->plugged_connected = !rc;
++
+ 	return rc;
+ }
+ 
+@@ -667,10 +675,7 @@ static int msm_dp_display_prepare_link(struct msm_dp_display_private *dp)
+ 	if (dp->link->sink_count == 0)
+ 		return -ENOTCONN;
+ 
+-	if (!msm_dp_display->power_on) {
+-		msm_dp_display_host_phy_init(dp);
+-		force_link_train = true;
+-	}
++	msm_dp_display_host_phy_init(dp);
+ 
+ 	rc = msm_dp_ctrl_on_link(dp->ctrl, dp->panel);
+ 	if (rc) {
+-- 
+2.56.0
+
+
+From 468794c5e7d38121b02d615b13b8d4072d8e4850 Mon Sep 17 00:00:00 2001
+From: Xi Zhang <xz.ca.cn@gmail.com>
+Date: Wed, 28 Oct 2026 13:07:21 -0300
+Subject: [PATCH 23/28] phy: qcom: qmp-combo: reset mode when dp is powered off
+
+---
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c | 79 +++++++++++++----------
+ 1 file changed, 46 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index c39ced168d03..0f6567fa3458 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -2587,6 +2587,7 @@ struct qmp_combo {
+ 	struct mutex phy_mutex;
+ 	int init_count;
+ 	enum qmpphy_mode qmpphy_mode;
++	bool qmpphy_mode_pending;
+ 
+ 	struct phy *usb_phy;
+ 	enum phy_mode phy_mode;
+@@ -4198,6 +4199,7 @@ static int qmp_combo_dp_power_on(struct phy *phy)
+ 	return 0;
+ }
+ 
++static void qmp_combo_reset_mode(struct qmp_combo *qmp);
+ static int qmp_combo_dp_power_off(struct phy *phy)
+ {
+ 	struct qmp_combo *qmp = phy_get_drvdata(phy);
+@@ -4209,6 +4211,12 @@ static int qmp_combo_dp_power_off(struct phy *phy)
+ 
+ 	qmp->dp_powered_on = false;
+ 
++	if (qmp->qmpphy_mode_pending) {
++		dev_info(qmp->dev, "DP PHY powered off, delayed switch\n");
++		qmp_combo_reset_mode(qmp);
++		qmp->qmpphy_mode_pending = false;
++	}
++
+ 	mutex_unlock(&qmp->phy_mutex);
+ 
+ 	return 0;
+@@ -4785,7 +4793,9 @@ static int qmp_combo_typec_switch_set(struct typec_switch_dev *sw,
+ 	mutex_lock(&qmp->phy_mutex);
+ 	qmp->orientation = orientation;
+ 
+-	if (qmp->init_count) {
++	if (qmp->dp_powered_on) {
++		qmp->qmpphy_mode_pending = true;
++	} else if (qmp->init_count) {
+ 		if (qmp->usb_init_count)
+ 			qmp_combo_usb_power_off(qmp->usb_phy);
+ 		qmp_combo_com_exit(qmp, true);
+@@ -4801,10 +4811,35 @@ static int qmp_combo_typec_switch_set(struct typec_switch_dev *sw,
+ 	return 0;
+ }
+ 
++static void qmp_combo_reset_mode(struct qmp_combo *qmp)
++{
++	if (qmp->init_count) {
++		if (qmp->qmpphy_mode != QMPPHY_MODE_DP_ONLY)
++			if (qmp->usb_init_count)
++				qmp_combo_usb_power_off(qmp->usb_phy);
++
++		if (qmp->qmpphy_mode == QMPPHY_MODE_USB3_ONLY)
++			if (qmp->dp_init_count)
++				writel(DP_PHY_PD_CTL_PSR_PWRDN, qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL);
++
++		qmp_combo_com_exit(qmp, true);
++
++		/* Now everything's powered down, power up the right PHYs */
++		qmp_combo_com_init(qmp, true);
++
++		if (qmp->qmpphy_mode != QMPPHY_MODE_DP_ONLY)
++			if (qmp->usb_init_count)
++				qmp_combo_usb_power_on(qmp->usb_phy);
++
++		if (qmp->qmpphy_mode == QMPPHY_MODE_DP_ONLY || qmp->qmpphy_mode == QMPPHY_MODE_USB3DP)
++			if (qmp->dp_init_count)
++				qmp->cfg->dp_aux_init(qmp);
++	}
++}
++
+ static int qmp_combo_typec_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
+ {
+ 	struct qmp_combo *qmp = typec_mux_get_drvdata(mux);
+-	const struct qmp_phy_cfg *cfg = qmp->cfg;
+ 	enum qmpphy_mode new_mode;
+ 	unsigned int svid;
+ 
+@@ -4838,48 +4873,23 @@ static int qmp_combo_typec_mux_set(struct typec_mux_dev *mux, struct typec_mux_s
+ 	}
+ 
+ 	if (new_mode == qmp->qmpphy_mode) {
+-		dev_dbg(qmp->dev, "typec_mux_set: same qmpphy mode, bail out\n");
++		dev_info(qmp->dev, "typec_mux_set: same qmpphy mode, bail out\n");
+ 		return 0;
+ 	}
+ 
+ 	if (qmp->qmpphy_mode != QMPPHY_MODE_USB3_ONLY && qmp->dp_powered_on) {
+-		dev_dbg(qmp->dev, "typec_mux_set: DP PHY is still in use, delaying switch\n");
++		dev_info(qmp->dev, "typec_mux_set: DP PHY is still in use, delaying switch\n");
++		qmp->qmpphy_mode = new_mode;
++		qmp->qmpphy_mode_pending = true;
+ 		return 0;
+ 	}
+ 
+-	dev_dbg(qmp->dev, "typec_mux_set: switching from qmpphy mode %d to %d\n",
++	dev_info(qmp->dev, "typec_mux_set: switching from qmpphy mode %d to %d\n",
+ 		qmp->qmpphy_mode, new_mode);
+ 
+ 	qmp->qmpphy_mode = new_mode;
+ 
+-	if (qmp->init_count) {
+-		if (qmp->usb_init_count)
+-			qmp_combo_usb_power_off(qmp->usb_phy);
+-
+-		if (qmp->dp_init_count)
+-			writel(DP_PHY_PD_CTL_PSR_PWRDN, qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL);
+-
+-		qmp_combo_com_exit(qmp, true);
+-
+-		/* Now everything's powered down, power up the right PHYs */
+-		qmp_combo_com_init(qmp, true);
+-
+-		if (new_mode == QMPPHY_MODE_DP_ONLY) {
+-			if (qmp->usb_init_count)
+-				qmp->usb_init_count--;
+-		}
+-
+-		if (new_mode == QMPPHY_MODE_USB3DP || new_mode == QMPPHY_MODE_USB3_ONLY) {
+-			qmp_combo_usb_power_on(qmp->usb_phy);
+-			if (!qmp->usb_init_count)
+-				qmp->usb_init_count++;
+-		}
+-
+-		if (new_mode == QMPPHY_MODE_DP_ONLY || new_mode == QMPPHY_MODE_USB3DP) {
+-			if (qmp->dp_init_count)
+-				cfg->dp_aux_init(qmp);
+-		}
+-	}
++	qmp_combo_reset_mode(qmp);
+ 
+ 	return 0;
+ }
+@@ -4934,6 +4944,9 @@ static int qmp_combo_typec_register(struct qmp_combo *qmp)
+ {
+ 	return 0;
+ }
++static void qmp_combo_reset_mode(struct qmp_combo *qmp)
++{
++}
+ #endif
+ 
+ static int qmp_combo_parse_dt_legacy_dp(struct qmp_combo *qmp, struct device_node *np)
+-- 
+2.56.0
+
+
+From ce909325259ec2e61546436d1394ff107b00f53e Mon Sep 17 00:00:00 2001
+From: Xi Zhang <xz.ca.cn@gmail.com>
+Date: Wed, 28 Oct 2026 13:07:43 -0300
+Subject: [PATCH 24/28] drm/msm/dp: link info and display lock
+
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c    | 26 ++++++++------------------
+ drivers/gpu/drm/msm/dp/dp_display.c |  5 +++++
+ drivers/gpu/drm/msm/dp/dp_panel.c   |  1 +
+ 3 files changed, 14 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 524c87d8d2d4..8543cd8865f0 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -2388,39 +2388,29 @@ int msm_dp_ctrl_on_link(struct msm_dp_ctrl *msm_dp_ctrl,
+ {
+ 	int rc = 0;
+ 	struct msm_dp_ctrl_private *ctrl;
+-	u32 rate;
+ 	int link_train_max_retries = 5;
+-	u32 const phy_cts_pixel_clk_khz = 148500;
+ 	u8 link_status[DP_LINK_STATUS_SIZE];
+ 	unsigned int training_step;
+-	unsigned long pixel_rate;
+ 
+ 	if (!msm_dp_ctrl)
+ 		return -EINVAL;
+ 
+ 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
+ 
+-	rate = panel->link_info.rate;
+-	pixel_rate = panel->msm_dp_mode.drm_mode.clock;
+-
+ 	msm_dp_ctrl_core_clk_enable(&ctrl->msm_dp_ctrl);
+ 
+ 	if (ctrl->link->sink_request & DP_TEST_LINK_PHY_TEST_PATTERN) {
+ 		drm_dbg_dp(ctrl->drm_dev,
+ 				"using phy test link parameters\n");
+-		if (!pixel_rate)
+-			pixel_rate = phy_cts_pixel_clk_khz;
+-	} else {
+-		ctrl->link->link_params.rate = rate;
+-		ctrl->link->link_params.num_lanes =
+-			panel->link_info.num_lanes;
+-		if (panel->msm_dp_mode.out_fmt_is_yuv_420)
+-			pixel_rate >>= 1;
+-	}
++		ctrl->link->link_params = (struct msm_dp_link_info) {
++			.rate = 810000,
++			.num_lanes = 4,
++		};
++	} else
++		ctrl->link->link_params = panel->link_info;
+ 
+-	drm_dbg_dp(ctrl->drm_dev, "rate=%d, num_lanes=%d, pixel_rate=%lu\n",
+-		ctrl->link->link_params.rate, ctrl->link->link_params.num_lanes,
+-		pixel_rate);
++	drm_dbg_dp(ctrl->drm_dev, "rate=%d, num_lanes=%d\n",
++		ctrl->link->link_params.rate, ctrl->link->link_params.num_lanes);
+ 
+ 	if (!ctrl->link_clks_on) { /* link clk is off */
+ 		rc = msm_dp_ctrl_enable_mainlink_clocks(ctrl, panel);
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index c68e42890cd8..e80e852081e2 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -786,6 +786,9 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
+ 	}
+ 
+ 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
++
++	guard(mutex)(&msm_dp_display->plugged_lock);
++
+ 	link_info = &msm_dp_display->panel->link_info;
+ 
+ 	is_yuv_420 = drm_mode_is_420_only(&dp->connector->display_info, mode);
+@@ -832,6 +835,8 @@ int msm_dp_bridge_get_modes(struct drm_bridge *bridge, struct drm_connector *con
+ 	msm_dp_display = to_dp_bridge(bridge)->msm_dp_display;
+ 	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+ 
++	guard(mutex)(&dp->plugged_lock);
++
+ 	if (dp->plugged_connected) {
+ 		return drm_edid_connector_add_modes(dp->panel->connector);
+ 	} else {
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.c b/drivers/gpu/drm/msm/dp/dp_panel.c
+index d3468b73fdc3..a5d098cc320f 100644
+--- a/drivers/gpu/drm/msm/dp/dp_panel.c
++++ b/drivers/gpu/drm/msm/dp/dp_panel.c
+@@ -195,6 +195,7 @@ static int msm_dp_panel_read_dpcd(struct msm_dp_panel *msm_dp_panel)
+ 
+ 	msm_dp_panel->vsc_sdp_supported = drm_dp_vsc_sdp_supported(panel->aux, dpcd);
+ 	link_info = &msm_dp_panel->link_info;
++	*link_info = (struct msm_dp_link_info) { 0 };
+ 	link_info->revision = dpcd[DP_DPCD_REV];
+ 	major = (link_info->revision >> 4) & 0x0f;
+ 	minor = link_info->revision & 0x0f;
+-- 
+2.56.0
+
+
+From bc524a7ae12a577ef44f336a198e63d5e05bfc55 Mon Sep 17 00:00:00 2001
+From: Xi Zhang <xz.ca.cn@gmail.com>
+Date: Wed, 28 Oct 2026 13:11:26 -0300
+Subject: [PATCH 25/28] drm/msm/dp: link clock phy power check
+
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c | 21 ++++++++-------------
+ 1 file changed, 8 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 8543cd8865f0..d38b904e8990 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -1839,9 +1839,14 @@ static int msm_dp_ctrl_link_clk_enable(struct msm_dp_ctrl *msm_dp_ctrl)
+ 		msm_dp_ctrl_core_clk_enable(msm_dp_ctrl);
+ 	}
+ 
++	phy_power_on(ctrl->phy);
++
+ 	ret = clk_bulk_prepare_enable(ctrl->num_link_clks, ctrl->link_clks);
+-	if (ret)
++	if (ret) {
++		DRM_ERROR("Unable to start link clocks. ret=%d\n", ret);
++		phy_power_off(ctrl->phy);
+ 		return ret;
++	}
+ 
+ 	ctrl->link_clks_on = true;
+ 
+@@ -1867,6 +1872,8 @@ static void msm_dp_ctrl_link_clk_disable(struct msm_dp_ctrl *msm_dp_ctrl)
+ 
+ 	clk_bulk_disable_unprepare(ctrl->num_link_clks, ctrl->link_clks);
+ 
++	phy_power_off(ctrl->phy);
++
+ 	ctrl->link_clks_on = false;
+ 
+ 	drm_dbg_dp(ctrl->drm_dev, "disabled link clocks\n");
+@@ -1888,14 +1895,9 @@ static int msm_dp_ctrl_enable_mainlink_clocks(struct msm_dp_ctrl_private *ctrl,
+ 	ctrl->phy_opts.dp.ssc = drm_dp_max_downspread(dpcd);
+ 
+ 	phy_configure(phy, &ctrl->phy_opts);
+-	phy_power_on(phy);
+ 
+ 	dev_pm_opp_set_rate(ctrl->dev, ctrl->link->link_params.rate * 1000);
+ 	ret = msm_dp_ctrl_link_clk_enable(&ctrl->msm_dp_ctrl);
+-	if (ret) {
+-		DRM_ERROR("Unable to start link clocks. ret=%d\n", ret);
+-		phy_power_off(phy);
+-	}
+ 
+ 	drm_dbg_dp(ctrl->drm_dev, "link rate=%d\n", ctrl->link->link_params.rate);
+ 
+@@ -2050,7 +2052,6 @@ static int msm_dp_ctrl_reinitialize_mainlink(struct msm_dp_ctrl_private *ctrl,
+ 	 */
+ 	msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
+ 
+-	phy_power_off(phy);
+ 	/* hw recommended delay before re-enabling clocks */
+ 	msleep(20);
+ 
+@@ -2076,8 +2077,6 @@ static int msm_dp_ctrl_deinitialize_mainlink(struct msm_dp_ctrl_private *ctrl,
+ 
+ 	msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
+ 
+-	phy_power_off(phy);
+-
+ 	/* aux channel down, reinit phy */
+ 	phy_exit(phy);
+ 	phy_init(phy);
+@@ -2687,18 +2686,14 @@ void msm_dp_ctrl_off_link(struct msm_dp_ctrl *msm_dp_ctrl,
+ 			  struct msm_dp_panel *panel)
+ {
+ 	struct msm_dp_ctrl_private *ctrl;
+-	struct phy *phy;
+ 
+ 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
+-	phy = ctrl->phy;
+ 
+ 	msm_dp_ctrl_mainlink_disable(ctrl);
+ 
+ 	msm_dp_ctrl_reset(&ctrl->msm_dp_ctrl, panel);
+ 
+ 	msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
+-
+-	phy_power_off(phy);
+ }
+ 
+ irqreturn_t msm_dp_ctrl_isr(struct msm_dp_ctrl *msm_dp_ctrl,
+-- 
+2.56.0
+
+
+From 1afe1810ed6aec6d0409af653ba9090ca9374b62 Mon Sep 17 00:00:00 2001
+From: Xi Zhang <xz.ca.cn@gmail.com>
+Date: Wed, 28 Oct 2026 13:26:58 -0300
+Subject: [PATCH 26/28] drm/msm/dp: audio comp wrap-around
+
+---
+ drivers/gpu/drm/msm/dp/dp_audio.c   | 18 ++++++++++++++----
+ drivers/gpu/drm/msm/dp/dp_display.c | 28 +++++++++++++++++++++-------
+ drivers/gpu/drm/msm/dp/dp_display.h |  5 +++--
+ 3 files changed, 38 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_audio.c b/drivers/gpu/drm/msm/dp/dp_audio.c
+index df222943ae57..0034119e0e01 100644
+--- a/drivers/gpu/drm/msm/dp/dp_audio.c
++++ b/drivers/gpu/drm/msm/dp/dp_audio.c
+@@ -276,6 +276,8 @@ int msm_dp_audio_prepare(struct drm_bridge *bridge,
+ 
+ 	msm_dp_display = to_dp_bridge(bridge)->msm_dp_display;
+ 
++	msm_dp_display_start(msm_dp_display);
++
+ 	/*
+ 	 * there could be cases where sound card can be opened even
+ 	 * before OR even when DP is not connected . This can cause
+@@ -299,10 +301,10 @@ int msm_dp_audio_prepare(struct drm_bridge *bridge,
+ 	msm_dp_audio_setup_acr(audio);
+ 	msm_dp_audio_safe_to_exit_level(audio);
+ 	msm_dp_audio_enable(audio, true);
+-	msm_dp_display_signal_audio_start(msm_dp_display);
+ 	msm_dp_display->audio_enabled = true;
+ 
+ end:
++	msm_dp_display_end(msm_dp_display);
+ 	return rc;
+ }
+ 
+@@ -313,10 +315,13 @@ void msm_dp_audio_shutdown(struct drm_bridge *bridge,
+ 	struct msm_dp *msm_dp_display;
+ 
+ 	msm_dp_display = to_dp_bridge(bridge)->msm_dp_display;
++
++	msm_dp_display_start(msm_dp_display);
++
+ 	audio = msm_dp_audio_get_data(msm_dp_display);
+ 	if (IS_ERR(audio)) {
+ 		DRM_ERROR("failed to get audio data\n");
+-		return;
++		goto end;
+ 	}
+ 
+ 	/*
+@@ -328,11 +333,16 @@ void msm_dp_audio_shutdown(struct drm_bridge *bridge,
+ 	 * to false earlier than this call
+ 	 */
+ 	if (!msm_dp_display->audio_enabled)
+-		return;
++		goto end;
+ 
+ 	msm_dp_audio_enable(audio, false);
++	msm_dp_display->audio_enabled = false;
++
++end:
+ 	/* signal the dp display to safely shutdown clocks */
+-	msm_dp_display_signal_audio_complete(msm_dp_display);
++	msm_dp_display_signal_audio(msm_dp_display);
++
++	msm_dp_display_end(msm_dp_display);
+ }
+ 
+ struct msm_dp_audio *msm_dp_audio_get(struct platform_device *pdev,
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index e80e852081e2..54c106b5695b 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -194,16 +194,26 @@ static struct msm_dp_display_private *dev_get_dp_display_private(struct device *
+ 	return container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ }
+ 
+-void msm_dp_display_signal_audio_start(struct msm_dp *msm_dp_display)
++void msm_dp_display_start(struct msm_dp *msm_dp_display)
+ {
+ 	struct msm_dp_display_private *dp;
+ 
+ 	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+ 
+-	reinit_completion(&dp->audio_comp);
++	mutex_lock(&dp->plugged_lock);
+ }
+ 
+-void msm_dp_display_signal_audio_complete(struct msm_dp *msm_dp_display)
++void msm_dp_display_end(struct msm_dp *msm_dp_display)
++{
++	struct msm_dp_display_private *dp;
++
++	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
++
++	mutex_unlock(&dp->plugged_lock);
++}
++
++
++void msm_dp_display_signal_audio(struct msm_dp *msm_dp_display)
+ {
+ 	struct msm_dp_display_private *dp;
+ 
+@@ -734,15 +744,19 @@ static void msm_dp_display_audio_notify_disable(struct msm_dp_display_private *d
+ 	struct msm_dp *msm_dp_display = &dp->msm_dp_display;
+ 
+ 	/* wait only if audio was enabled */
+-	if (msm_dp_display->audio_enabled) {
++	while (msm_dp_display->audio_enabled) {
++		reinit_completion(&dp->audio_comp);
+ 		/* signal the disconnect event */
+ 		msm_dp_display_handle_plugged_change(msm_dp_display, false);
++
++		mutex_unlock(&dp->plugged_lock);
+ 		if (!wait_for_completion_timeout(&dp->audio_comp,
+-				HZ * 5))
++				HZ * 5)) {
+ 			DRM_ERROR("audio comp timeout\n");
++			msm_dp_display->audio_enabled = false;
++		}
++		mutex_lock(&dp->plugged_lock);
+ 	}
+-
+-	msm_dp_display->audio_enabled = false;
+ }
+ 
+ static int msm_dp_display_disable(struct msm_dp_display_private *dp,
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.h b/drivers/gpu/drm/msm/dp/dp_display.h
+index 8d12db49b253..b3bac0ed7c0c 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.h
++++ b/drivers/gpu/drm/msm/dp/dp_display.h
+@@ -28,8 +28,9 @@ struct msm_dp {
+ 
+ bool msm_dp_display_check_video_test(struct msm_dp *msm_dp_display);
+ int msm_dp_display_get_test_bpp(struct msm_dp *msm_dp_display);
+-void msm_dp_display_signal_audio_start(struct msm_dp *msm_dp_display);
+-void msm_dp_display_signal_audio_complete(struct msm_dp *msm_dp_display);
++void msm_dp_display_start(struct msm_dp *msm_dp_display);
++void msm_dp_display_end(struct msm_dp *msm_dp_display);
++void msm_dp_display_signal_audio(struct msm_dp *msm_dp_display);
+ void msm_dp_display_set_psr(struct msm_dp *dp, bool enter);
+ void msm_dp_display_debugfs_init(struct msm_dp *msm_dp_display, struct dentry *dentry, bool is_edp);
+ void msm_dp_display_atomic_post_disable(struct msm_dp *dp_display);
+-- 
+2.56.0
+
+
+From 9e0ca86371cc6ab08cd337b10813f6ab87780db2 Mon Sep 17 00:00:00 2001
+From: Antigravity <antigravity@google.com>
+Date: Wed, 28 Oct 2026 13:33:52 -0300
+Subject: [PATCH 27/28] usb: typec: nb7vpq904m: set client data in probe to
+ avoid crash on remove
+
+nb7vpq904m_probe allocates struct nb7vpq904m but neglects to call
+i2c_set_clientdata(client, nb7).
+In nb7vpq904m_remove, i2c_get_clientdata(client) returns NULL, leading
+to a NULL pointer dereference when accessing nb7->retimer or nb7->sw.
+
+Set client data upon successful allocation.
+
+Signed-off-by: Antigravity <antigravity@google.com>
+---
+ drivers/usb/typec/mux/nb7vpq904m.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/usb/typec/mux/nb7vpq904m.c b/drivers/usb/typec/mux/nb7vpq904m.c
+index d1fa26ff442c..52e3c9db35a7 100644
+--- a/drivers/usb/typec/mux/nb7vpq904m.c
++++ b/drivers/usb/typec/mux/nb7vpq904m.c
+@@ -396,6 +396,7 @@ static int nb7vpq904m_probe(struct i2c_client *client)
+ 		return -ENOMEM;
+ 
+ 	nb7->client = client;
++	i2c_set_clientdata(client, nb7);
+ 
+ 	nb7->regmap = devm_regmap_init_i2c(client, &nb7_regmap);
+ 	if (IS_ERR(nb7->regmap)) {
+-- 
+2.56.0
+
+
+From 0be1f09f718bc923f32293d0be99b0452473faa7 Mon Sep 17 00:00:00 2001
+From: Xi Zhang <xz.ca.cn@gmail.com>
+Date: Wed, 28 Oct 2026 13:35:46 -0300
+Subject: [PATCH 28/28] soc: qcom: pmic_glink_altmode: do not wait for ack on
+ PAN_ACK
+
+---
+ drivers/soc/qcom/pmic_glink_altmode.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/soc/qcom/pmic_glink_altmode.c b/drivers/soc/qcom/pmic_glink_altmode.c
+index ef4a3ab65b6e..55bfdd9ee928 100644
+--- a/drivers/soc/qcom/pmic_glink_altmode.c
++++ b/drivers/soc/qcom/pmic_glink_altmode.c
+@@ -173,11 +173,12 @@ static int pmic_glink_altmode_request(struct pmic_glink_altmode *altmode, u32 cm
+ 		return ret;
+ 	}
+ 
++	if (cmd == ALTMODE_PAN_ACK)
++		return 0;
++
+ 	left = wait_for_completion_timeout(&altmode->pan_ack, 5 * HZ);
+-	if (!left) {
++	if (!left)
+ 		dev_err(altmode->dev, "timeout waiting for altmode request ack for: %#x\n", cmd);
+-		return -ETIMEDOUT;
+-	}
+ 
+ 	return 0;
+ }
+-- 
+2.56.0
+
