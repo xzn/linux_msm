@@ -1,0 +1,187 @@
+From 7bd6d2ac7bd7fca5d15a7f245a782441b6d0076a Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 6 Oct 2026 02:59:29 -0300
+Subject: [PATCH 214/219] drm/msm/dp: retry hpd after errors such as link train
+ failure
+
+To accommodate this change, link training is moved back to hpd_high.
+force_link_train is set to true in display_enable (atomic_enable).
+
+Introduce plugged_connected bool to separate connector ready state
+from underlying phy ready to allow retry.
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 70 ++++++++++++++++++++++++-----
+ 1 file changed, 58 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 4c1d6af8f9cd..4c45dacec93c 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -55,6 +55,8 @@ struct msm_dp_display_private {
+ 
+ 	struct mutex plugged_lock;
+ 	bool plugged;
++	bool plugged_connected;
++	struct work_struct plugged_retry_work;
+ 
+ 	struct drm_device *drm_dev;
+ 
+@@ -293,6 +295,12 @@ static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
+ 
+ 	msm_dp_link_reset_phy_params_vx_px(dp->link);
+ 
++	rc = msm_dp_ctrl_on_link(dp->ctrl);
++	if (rc) {
++		DRM_ERROR("Failed link training (rc=%d)\n", rc);
++		goto end;
++	}
++
+ end:
+ 	return rc;
+ }
+@@ -390,6 +398,8 @@ static int msm_dp_hpd_plug_handle_guarded(struct msm_dp_display_private *dp)
+ 			dp->msm_dp_display.connector_type,
+ 			dp->link->sink_count);
+ 
++	if (dp->plugged_connected)
++		return 0;
+ 
+ 	if (!dp->plugged) {
+ 		ret = pm_runtime_resume_and_get(&pdev->dev);
+@@ -424,6 +434,7 @@ static int msm_dp_hpd_plug_handle_guarded(struct msm_dp_display_private *dp)
+ 			dp->link->sink_count);
+ 
+ end:
++	dp->plugged_connected = !ret;
+ 
+ 	return ret;
+ }
+@@ -462,7 +473,7 @@ static int msm_dp_hpd_unplug_handle_guarded(struct msm_dp_display_private *dp)
+ 		msm_dp_panel_unplugged(dp->panel, dp->msm_dp_display.connector);
+ 
+ 	/* triggered by irq_hdp with sink_count = 0 */
+-	if (dp->link->sink_count == 0)
++	if (!dp->msm_dp_display.power_on)
+ 		msm_dp_display_host_phy_exit(dp);
+ 
+ 	/*
+@@ -487,6 +498,8 @@ static int msm_dp_hpd_unplug_handle_guarded(struct msm_dp_display_private *dp)
+ 		dp->plugged = false;
+ 	}
+ 
++	dp->plugged_connected = false;
++
+ 	return 0;
+ }
+ 
+@@ -520,6 +533,7 @@ static int msm_dp_irq_hpd_handle_guarded(struct msm_dp_display_private *dp)
+ 			dp->link->sink_count);
+ 
+ end:
++	dp->plugged_connected = !rc;
+ 
+ 	return rc;
+ }
+@@ -624,7 +638,7 @@ static int msm_dp_display_enable(struct msm_dp_display_private *dp)
+ 		return 0;
+ 	}
+ 
+-	rc = msm_dp_ctrl_on_stream(dp->ctrl, false);
++	rc = msm_dp_ctrl_on_stream(dp->ctrl, true);
+ 	if (!rc)
+ 		msm_dp_display->power_on = true;
+ 
+@@ -849,13 +863,41 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
+ 	struct msm_dp_bridge *msm_dp_bridge = to_dp_bridge(bridge);
+ 	struct msm_dp *dp = msm_dp_bridge->msm_dp_display;
+ 	struct msm_dp_display_private *priv;
++	int rc;
+ 
+ 	dp = to_dp_bridge(bridge)->msm_dp_display;
+ 
+ 	priv = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 
+ 	guard(mutex)(&priv->plugged_lock);
+-	return priv->plugged ? connector_status_connected : connector_status_disconnected;
++
++	/* Retry for plug_handle fail, or for plugged_retry_work_fn. */
++	if (priv->plugged && !priv->plugged_connected) {
++		rc = msm_dp_hpd_plug_handle_guarded(priv);
++		if (rc) {
++			msm_dp_hpd_unplug_handle_guarded(priv);
++			/* Resend event for status_disconnected */
++			schedule_work(&priv->plugged_retry_work);
++		}
++	}
++
++	return priv->plugged_connected ? connector_status_connected : connector_status_disconnected;
++}
++
++static void msm_dp_display_plugged_retry_work_fn(struct work_struct *work)
++{
++	struct msm_dp_display_private *msm_dp_display = container_of(work,
++								     typeof(*msm_dp_display),
++								     plugged_retry_work);
++	struct msm_dp *dp = &msm_dp_display->msm_dp_display;
++
++	guard(mutex)(&msm_dp_display->plugged_lock);
++
++	mutex_lock(&dp->drm_dev->mode_config.mutex);
++	drm_connector_set_link_status_property(dp->connector, DRM_MODE_LINK_STATUS_BAD);
++	mutex_unlock(&dp->drm_dev->mode_config.mutex);
++
++	drm_kms_helper_connector_hotplug_event(dp->connector);
+ }
+ 
+ static irqreturn_t msm_dp_display_irq_handler(int irq, void *dev_id)
+@@ -1113,6 +1155,8 @@ static int msm_dp_display_probe(struct platform_device *pdev)
+ 	dp->hpd_isr_status = 0;
+ 
+ 	mutex_init(&dp->plugged_lock);
++	INIT_WORK(&dp->plugged_retry_work,
++		  msm_dp_display_plugged_retry_work_fn);
+ 
+ 	rc = msm_dp_display_get_io(dp);
+ 	if (rc)
+@@ -1331,27 +1375,29 @@ void msm_dp_bridge_atomic_enable(struct drm_bridge *drm_bridge,
+ 	rc = msm_dp_display_set_mode(dp, &msm_dp_display->msm_dp_mode);
+ 	if (rc) {
+ 		DRM_ERROR("Failed to perform a mode set, rc=%d\n", rc);
+-		return;
++		goto end;
+ 	}
+ 
+ 	msm_dp_display_host_phy_init(msm_dp_display);
+ 
+-	rc = msm_dp_ctrl_on_link(msm_dp_display->ctrl);
+-	if (rc) {
+-		DRM_ERROR("Failed link training (rc=%d)\n", rc);
+-		// TODO: schedule drm_connector_set_link_status_property()
+-		return;
+-	}
+-
+-	msm_dp_display_enable(msm_dp_display);
++	rc = msm_dp_display_enable(msm_dp_display);
++	if (rc)
++		goto end;
+ 
+ 	rc = msm_dp_display_post_enable(dp);
+ 	if (rc) {
+ 		DRM_ERROR("DP display post enable failed, rc=%d\n", rc);
+ 		msm_dp_display_disable(msm_dp_display);
++		goto end;
+ 	}
+ 
+ 	drm_dbg_dp(dp->drm_dev, "type=%d Done\n", dp->connector_type);
++
++end:
++	if (rc) {
++		msm_dp_display->plugged_connected = false;
++		schedule_work(&msm_dp_display->plugged_retry_work);
++	}
+ }
+ 
+ void msm_dp_bridge_atomic_disable(struct drm_bridge *drm_bridge,
+-- 
+2.55.0
+

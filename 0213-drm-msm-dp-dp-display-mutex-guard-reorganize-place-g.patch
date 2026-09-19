@@ -1,0 +1,196 @@
+From de4c4ba974ef0fe312556c48367255720fa2ef1d Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 6 Oct 2026 02:56:34 -0300
+Subject: [PATCH 213/219] drm/msm/dp: dp display mutex guard reorganize - place
+ guard on entry points
+
+plug_handle, unplug_handle, irq_hpd_handle have their implementations
+split from mutex guard.
+
+link_psm_config and link_process_request are hoisted from hpd_high.
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 59 +++++++++++++++++++----------
+ 1 file changed, 38 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 061a36934bd7..4c1d6af8f9cd 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -280,8 +280,6 @@ static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
+ 	if (rc)
+ 		goto end;
+ 
+-	msm_dp_link_process_request(dp->link);
+-
+ 	if (!dp->msm_dp_display.is_edp)
+ 		drm_dp_set_subconnector_property(connector,
+ 						 connector_status_connected,
+@@ -293,12 +291,6 @@ static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
+ 	dp->audio_supported = info->has_audio;
+ 	msm_dp_panel_handle_sink_request(dp->panel);
+ 
+-	/*
+-	 * set sink to normal operation mode -- D0
+-	 * before dpcd read
+-	 */
+-	msm_dp_link_psm_config(dp->link, &dp->panel->link_info, false);
+-
+ 	msm_dp_link_reset_phy_params_vx_px(dp->link);
+ 
+ end:
+@@ -389,7 +381,7 @@ static int msm_dp_display_handle_irq_hpd(struct msm_dp_display_private *dp)
+ 	return 0;
+ }
+ 
+-static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
++static int msm_dp_hpd_plug_handle_guarded(struct msm_dp_display_private *dp)
+ {
+ 	int ret;
+ 	struct platform_device *pdev = dp->msm_dp_display.pdev;
+@@ -398,7 +390,6 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 			dp->msm_dp_display.connector_type,
+ 			dp->link->sink_count);
+ 
+-	guard(mutex)(&dp->plugged_lock);
+ 
+ 	if (!dp->plugged) {
+ 		ret = pm_runtime_resume_and_get(&pdev->dev);
+@@ -414,14 +405,28 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 		dp->plugged = true;
+ 	}
+ 
++	/*
++	 * set sink to normal operation mode -- D0
++	 * before dpcd read
++	 */
++	ret = msm_dp_link_psm_config(dp->link, &dp->panel->link_info, false);
++	if (ret)
++		goto end;
++
++	ret = msm_dp_link_process_request(dp->link);
++	if (ret)
++		goto end;
++
+ 	ret = msm_dp_display_process_hpd_high(dp);
+ 
+ 	drm_dbg_dp(dp->drm_dev, "After, type=%d sink_count=%d\n",
+ 			dp->msm_dp_display.connector_type,
+ 			dp->link->sink_count);
+ 
++end:
++
+ 	return ret;
+-};
++}
+ 
+ static void msm_dp_display_handle_plugged_change(struct msm_dp *msm_dp_display,
+ 		bool plugged)
+@@ -437,7 +442,7 @@ static void msm_dp_display_handle_plugged_change(struct msm_dp *msm_dp_display,
+ 							plugged);
+ }
+ 
+-static int msm_dp_hpd_unplug_handle(struct msm_dp_display_private *dp)
++static int msm_dp_hpd_unplug_handle_guarded(struct msm_dp_display_private *dp)
+ {
+ 	struct platform_device *pdev = dp->msm_dp_display.pdev;
+ 
+@@ -449,7 +454,6 @@ static int msm_dp_hpd_unplug_handle(struct msm_dp_display_private *dp)
+ 			dp->msm_dp_display.connector_type,
+ 			dp->link->sink_count);
+ 
+-	guard(mutex)(&dp->plugged_lock);
+ 	if (!dp->plugged)
+ 		return 0;
+ 
+@@ -486,7 +490,7 @@ static int msm_dp_hpd_unplug_handle(struct msm_dp_display_private *dp)
+ 	return 0;
+ }
+ 
+-static int msm_dp_irq_hpd_handle(struct msm_dp_display_private *dp)
++static int msm_dp_irq_hpd_handle_guarded(struct msm_dp_display_private *dp)
+ {
+ 	u32 sink_request;
+ 	int rc = 0;
+@@ -496,6 +500,10 @@ static int msm_dp_irq_hpd_handle(struct msm_dp_display_private *dp)
+ 			dp->msm_dp_display.connector_type,
+ 			dp->link->sink_count);
+ 
++	rc = msm_dp_link_psm_config(dp->link, &dp->panel->link_info, false);
++	if (rc)
++		goto end;
++
+ 	/* check for any test request issued by sink */
+ 	rc = msm_dp_link_process_request(dp->link);
+ 	if (!rc) {
+@@ -511,6 +519,8 @@ static int msm_dp_irq_hpd_handle(struct msm_dp_display_private *dp)
+ 			dp->msm_dp_display.connector_type,
+ 			dp->link->sink_count);
+ 
++end:
++
+ 	return rc;
+ }
+ 
+@@ -1299,13 +1309,16 @@ void msm_dp_bridge_atomic_enable(struct drm_bridge *drm_bridge,
+ 	struct msm_dp_display_private *msm_dp_display;
+ 
+ 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
++
++	guard(mutex)(&msm_dp_display->plugged_lock);
++
+ 	if (!msm_dp_display->msm_dp_mode.drm_mode.clock) {
+ 		DRM_ERROR("invalid params\n");
+ 		return;
+ 	}
+ 
+ 	if (dp->is_edp)
+-		msm_dp_hpd_plug_handle(msm_dp_display);
++		msm_dp_hpd_plug_handle_guarded(msm_dp_display);
+ 
+ 	if (pm_runtime_resume_and_get(&dp->pdev->dev)) {
+ 		DRM_ERROR("failed to pm_runtime_resume\n");
+@@ -1376,8 +1389,10 @@ void msm_dp_bridge_atomic_post_disable(struct drm_bridge *drm_bridge,
+ 
+ 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 
++	guard(mutex)(&msm_dp_display->plugged_lock);
++
+ 	if (dp->is_edp)
+-		msm_dp_hpd_unplug_handle(msm_dp_display);
++		msm_dp_hpd_unplug_handle_guarded(msm_dp_display);
+ 
+ 	msm_dp_display_disable(msm_dp_display);
+ 
+@@ -1469,6 +1484,8 @@ void msm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
+ 	struct msm_dp_display_private *dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+ 	u32 hpd_link_status = 0;
+ 
++	guard(mutex)(&dp->plugged_lock);
++
+ 	if (pm_runtime_resume_and_get(&msm_dp_display->pdev->dev)) {
+ 		DRM_ERROR("failed to pm_runtime_resume\n");
+ 		return;
+@@ -1481,15 +1498,15 @@ void msm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
+ 
+ 	if (status == connector_status_connected) {
+ 		if (hpd_link_status == ISR_HPD_REPLUG_COUNT) {
+-			msm_dp_hpd_unplug_handle(dp);
+-			msm_dp_hpd_plug_handle(dp);
++			msm_dp_hpd_unplug_handle_guarded(dp);
++			msm_dp_hpd_plug_handle_guarded(dp);
+ 		} else if (hpd_link_status == ISR_IRQ_HPD_PULSE_COUNT) {
+-			msm_dp_irq_hpd_handle(dp);
++			msm_dp_irq_hpd_handle_guarded(dp);
+ 		} else {
+-			msm_dp_hpd_plug_handle(dp);
++			msm_dp_hpd_plug_handle_guarded(dp);
+ 		}
+ 	} else {
+-		msm_dp_hpd_unplug_handle(dp);
++		msm_dp_hpd_unplug_handle_guarded(dp);
+ 	}
+ 
+ 	pm_runtime_put_sync(&msm_dp_display->pdev->dev);
+-- 
+2.55.0
+

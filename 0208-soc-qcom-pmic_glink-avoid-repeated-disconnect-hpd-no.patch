@@ -1,0 +1,52 @@
+From 7461b7bd96d9120c2d261e3c7823cd7a1ef74fa3 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 6 Oct 2026 02:45:16 -0300
+Subject: [PATCH 208/219] soc: qcom: pmic_glink: avoid repeated disconnect hpd
+ notify
+
+---
+ drivers/soc/qcom/pmic_glink_altmode.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/qcom/pmic_glink_altmode.c b/drivers/soc/qcom/pmic_glink_altmode.c
+index 619bad2c27ee..0ab78b5bd50e 100644
+--- a/drivers/soc/qcom/pmic_glink_altmode.c
++++ b/drivers/soc/qcom/pmic_glink_altmode.c
+@@ -110,6 +110,8 @@ struct pmic_glink_altmode_port {
+ 
+ 	struct work_struct work;
+ 
++	enum drm_connector_status conn_status;
++
+ 	struct auxiliary_device *bridge;
+ 
+ 	enum typec_orientation orientation;
+@@ -345,6 +347,16 @@ static void pmic_glink_altmode_safe(struct pmic_glink_altmode *altmode,
+ 		dev_err(altmode->dev, "failed to setup retimer to USB: %d\n", ret);
+ }
+ 
++static void pmic_glink_altmode_port_set_conn_status(struct pmic_glink_altmode_port *alt_port,
++						    enum drm_connector_status conn_status)
++{
++	/* Avoid repeated disconnect notify */
++	if (conn_status == alt_port->conn_status &&
++	    conn_status == connector_status_disconnected)
++		return;
++	drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
++}
++
+ static void pmic_glink_altmode_worker(struct work_struct *work)
+ {
+ 	struct pmic_glink_altmode_port *alt_port = work_to_altmode_port(work);
+@@ -373,7 +385,7 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
+ 		else
+ 			conn_status = connector_status_disconnected;
+ 
+-		drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
++		pmic_glink_altmode_port_set_conn_status(alt_port, conn_status);
+ 	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
+ 		if (alt_port->svid == USB_TYPEC_TBT_SID)
+ 			pmic_glink_altmode_enable_tbt(altmode, alt_port);
+-- 
+2.55.0
+

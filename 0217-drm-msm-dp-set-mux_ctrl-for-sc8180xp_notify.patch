@@ -1,0 +1,46 @@
+From e6274b71fe9d81a95d5fb4c1704aff3e756dcb17 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 6 Oct 2026 03:03:35 -0300
+Subject: [PATCH 217/219] drm/msm/dp: set mux_ctrl for sc8180xp_notify
+
+Fix sc8180xp_notify regression introduced in 0539c5a where mux_ctrl
+became required for dp altmode set, but weren't set
+---
+ drivers/soc/qcom/pmic_glink_altmode.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/soc/qcom/pmic_glink_altmode.c b/drivers/soc/qcom/pmic_glink_altmode.c
+index 77e90673f440..2d3297b5242c 100644
+--- a/drivers/soc/qcom/pmic_glink_altmode.c
++++ b/drivers/soc/qcom/pmic_glink_altmode.c
+@@ -467,9 +467,11 @@ static void pmic_glink_altmode_sc8180xp_notify(struct pmic_glink_altmode *altmod
+ 	u8 hpd_state;
+ 	u8 hpd_irq;
+ 	u16 svid;
++	u8 mux_ctrl;
+ 	u8 port;
+ 	u8 mode;
+ 	u8 mux;
++	u8 dp_mode;
+ 
+ 	if (len != sizeof(*msg)) {
+ 		dev_warn(altmode->dev, "invalid length of USBC_NOTIFY indication: %zd\n", len);
+@@ -485,7 +487,14 @@ static void pmic_glink_altmode_sc8180xp_notify(struct pmic_glink_altmode *altmod
+ 	hpd_state = FIELD_GET(SC8180X_HPD_STATE_MASK, notification);
+ 	hpd_irq = FIELD_GET(SC8180X_HPD_IRQ_MASK, notification);
+ 
+-	svid = mux == 2 ? USB_TYPEC_DP_SID : 0;
++	if (mux == 2) {
++		dp_mode = TYPEC_MODAL_STATE(mode);
++		svid = USB_TYPEC_DP_SID;
++		mux_ctrl = dp_mode == TYPEC_DP_STATE_D ? MUX_CTRL_STATE_USB3_DP : MUX_CTRL_STATE_DP4LN;
++	} else {
++		svid = 0;
++		mux_ctrl = MUX_CTRL_STATE_USB3_ONLY;
++	}
+ 
+ 	if (port >= ARRAY_SIZE(altmode->ports) || !altmode->ports[port].altmode) {
+ 		dev_dbg(altmode->dev, "notification on undefined port %d\n", port);
+-- 
+2.55.0
+

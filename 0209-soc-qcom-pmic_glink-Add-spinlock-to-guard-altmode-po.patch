@@ -1,0 +1,273 @@
+From a2dfcf308a8e7b40eafdb27841abccf101742da9 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 6 Oct 2026 02:46:14 -0300
+Subject: [PATCH 209/219] soc: qcom: pmic_glink: Add spinlock to guard altmode
+ port data
+
+Place altmode port data in a separate struct.
+---
+ drivers/soc/qcom/pmic_glink_altmode.c | 122 +++++++++++++++++---------
+ 1 file changed, 80 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/soc/qcom/pmic_glink_altmode.c b/drivers/soc/qcom/pmic_glink_altmode.c
+index 0ab78b5bd50e..3387c9ec926c 100644
+--- a/drivers/soc/qcom/pmic_glink_altmode.c
++++ b/drivers/soc/qcom/pmic_glink_altmode.c
+@@ -96,6 +96,17 @@ struct pmic_glink_altmode;
+ 
+ #define work_to_altmode_port(w) container_of((w), struct pmic_glink_altmode_port, work)
+ 
++struct pmic_glink_altmode_port_data {
++	enum typec_orientation orientation;
++	u16 svid;
++	struct usbc_sc8280x_tbt_data tbt_data;
++	u8 dp_data;
++	u8 mode;
++	u8 hpd_state;
++	u8 hpd_irq;
++	u8 mux_ctrl;
++};
++
+ struct pmic_glink_altmode_port {
+ 	struct pmic_glink_altmode *altmode;
+ 	unsigned int index;
+@@ -108,20 +119,14 @@ struct pmic_glink_altmode_port {
+ 	struct typec_altmode dp_alt;
+ 	struct typec_altmode tbt_alt;
+ 
++	spinlock_t work_irq_lock;
+ 	struct work_struct work;
+ 
+ 	enum drm_connector_status conn_status;
+ 
+ 	struct auxiliary_device *bridge;
+ 
+-	enum typec_orientation orientation;
+-	u16 svid;
+-	struct usbc_sc8280x_tbt_data tbt_data;
+-	u8 dp_data;
+-	u8 mode;
+-	u8 hpd_state;
+-	u8 hpd_irq;
+-	u8 mux_ctrl;
++	struct pmic_glink_altmode_port_data data;
+ };
+ 
+ #define work_to_altmode(w) container_of((w), struct pmic_glink_altmode, enable_work)
+@@ -208,9 +213,10 @@ static void pmic_glink_altmode_enable_dp(struct pmic_glink_altmode *altmode,
+ }
+ 
+ static void pmic_glink_altmode_enable_tbt(struct pmic_glink_altmode *altmode,
+-					  struct pmic_glink_altmode_port *port)
++					  struct pmic_glink_altmode_port *port,
++					  struct usbc_sc8280x_tbt_data *tbt,
++					  u8 mode)
+ {
+-	struct usbc_sc8280x_tbt_data *tbt = &port->tbt_data;
+ 	struct typec_thunderbolt_data tbt_data = {};
+ 	u32 cable_speed;
+ 	int ret;
+@@ -250,7 +256,7 @@ static void pmic_glink_altmode_enable_tbt(struct pmic_glink_altmode *altmode,
+ 
+ 	port->state.alt = &port->tbt_alt;
+ 	port->state.data = &tbt_data;
+-	port->state.mode = TYPEC_MODAL_STATE(port->mode);
++	port->state.mode = TYPEC_MODAL_STATE(mode);
+ 
+ 	ret = typec_mux_set(port->typec_mux, &port->state);
+ 	if (ret)
+@@ -258,7 +264,7 @@ static void pmic_glink_altmode_enable_tbt(struct pmic_glink_altmode *altmode,
+ 
+ 	port->retimer_state.alt = &port->tbt_alt;
+ 	port->retimer_state.data = &tbt_data;
+-	port->retimer_state.mode = TYPEC_MODAL_STATE(port->mode);
++	port->retimer_state.mode = TYPEC_MODAL_STATE(mode);
+ 
+ 	ret = typec_retimer_set(port->typec_retimer, &port->retimer_state);
+ 	if (ret)
+@@ -266,9 +272,9 @@ static void pmic_glink_altmode_enable_tbt(struct pmic_glink_altmode *altmode,
+ }
+ 
+ static void pmic_glink_altmode_enable_usb4(struct pmic_glink_altmode *altmode,
+-					   struct pmic_glink_altmode_port *port)
++					   struct pmic_glink_altmode_port *port,
++					   struct usbc_sc8280x_tbt_data *tbt)
+ {
+-	struct usbc_sc8280x_tbt_data *tbt = &port->tbt_data;
+ 	struct enter_usb_data data = {};
+ 	int ret;
+ 
+@@ -357,47 +363,64 @@ static void pmic_glink_altmode_port_set_conn_status(struct pmic_glink_altmode_po
+ 	drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
+ }
+ 
++static void pmic_glink_alt_port_worker_get_data(struct pmic_glink_altmode_port *alt_port,
++						struct pmic_glink_altmode_port_data *alt_data)
++{
++	unsigned long flags;
++	spin_lock_irqsave(&alt_port->work_irq_lock, flags);
++	*alt_data = alt_port->data;
++	spin_unlock_irqrestore(&alt_port->work_irq_lock, flags);
++}
++
+ static void pmic_glink_altmode_worker(struct work_struct *work)
+ {
+ 	struct pmic_glink_altmode_port *alt_port = work_to_altmode_port(work);
+ 	struct pmic_glink_altmode *altmode = alt_port->altmode;
++	struct pmic_glink_altmode_port_data alt_data;
+ 	enum drm_connector_status conn_status;
+ 
+-	typec_switch_set(alt_port->typec_switch, alt_port->orientation);
++	pmic_glink_alt_port_worker_get_data(alt_port, &alt_data);
++
++	typec_switch_set(alt_port->typec_switch, alt_data.orientation);
+ 
+ 	/*
+ 	 * MUX_CTRL_STATE_DP4LN/USB3_DP may only be set if SVID=DP, but we need
+ 	 * to special-case the SVID=DP && mux_ctrl=NO_CONN case to deliver a
+ 	 * HPD notification
+ 	 */
+-	if (alt_port->svid == USB_TYPEC_DP_SID) {
+-		if (alt_port->mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
++	if (alt_data.svid == USB_TYPEC_DP_SID) {
++		if (alt_data.mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
+ 			pmic_glink_altmode_safe(altmode, alt_port);
+ 		} else {
+ 			pmic_glink_altmode_enable_dp(altmode, alt_port,
+-						     alt_port->mode,
+-						     alt_port->hpd_state,
+-						     alt_port->hpd_irq);
++						     alt_data.mode,
++						     alt_data.hpd_state,
++						     alt_data.hpd_irq);
+ 		}
+ 
+-		if (alt_port->hpd_state)
++		if (alt_data.hpd_state)
+ 			conn_status = connector_status_connected;
+ 		else
+ 			conn_status = connector_status_disconnected;
+ 
+ 		pmic_glink_altmode_port_set_conn_status(alt_port, conn_status);
+-	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
+-		if (alt_port->svid == USB_TYPEC_TBT_SID)
+-			pmic_glink_altmode_enable_tbt(altmode, alt_port);
++	} else if (alt_data.mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
++		if (alt_data.svid == USB_TYPEC_TBT_SID)
++			pmic_glink_altmode_enable_tbt(altmode,
++						      alt_port,
++						      &alt_data.tbt_data,
++						      alt_data.mode);
+ 		else
+-			pmic_glink_altmode_enable_usb4(altmode, alt_port);
+-	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_USB3_ONLY) {
++			pmic_glink_altmode_enable_usb4(altmode,
++						       alt_port,
++						       &alt_data.tbt_data);
++	} else if (alt_data.mux_ctrl == MUX_CTRL_STATE_USB3_ONLY) {
+ 		pmic_glink_altmode_enable_usb(altmode, alt_port);
+-	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
++	} else if (alt_data.mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
+ 		pmic_glink_altmode_safe(altmode, alt_port);
+ 	} else {
+ 		dev_err(altmode->dev, "Got unknown mux_ctrl: %u on port %u, forcing safe mode\n",
+-			alt_port->mux_ctrl, alt_port->index);
++			alt_data.mux_ctrl, alt_port->index);
+ 		pmic_glink_altmode_safe(altmode, alt_port);
+ 	}
+ 
+@@ -421,10 +444,20 @@ static enum typec_orientation pmic_glink_altmode_orientation(unsigned int orient
+ #define SC8180X_HPD_STATE_MASK		0x40000000
+ #define SC8180X_HPD_IRQ_MASK		0x80000000
+ 
++static void pmic_glink_alt_port_irq_set_data(struct pmic_glink_altmode_port *alt_port,
++					     const struct pmic_glink_altmode_port_data *alt_data)
++{
++	unsigned long flags;
++	spin_lock_irqsave(&alt_port->work_irq_lock, flags);
++	alt_port->data = *alt_data;
++	spin_unlock_irqrestore(&alt_port->work_irq_lock, flags);
++}
++
+ static void pmic_glink_altmode_sc8180xp_notify(struct pmic_glink_altmode *altmode,
+ 					       const void *data, size_t len)
+ {
+ 	struct pmic_glink_altmode_port *alt_port;
++	struct pmic_glink_altmode_port_data alt_data = { };
+ 	const struct usbc_sc8180x_notify *msg;
+ 	u32 notification;
+ 	u8 orientation;
+@@ -456,12 +489,14 @@ static void pmic_glink_altmode_sc8180xp_notify(struct pmic_glink_altmode *altmod
+ 		return;
+ 	}
+ 
++	alt_data.orientation = pmic_glink_altmode_orientation(orientation);
++	alt_data.svid = svid;
++	alt_data.mode = mode;
++	alt_data.hpd_state = hpd_state;
++	alt_data.hpd_irq = hpd_irq;
++
+ 	alt_port = &altmode->ports[port];
+-	alt_port->orientation = pmic_glink_altmode_orientation(orientation);
+-	alt_port->svid = svid;
+-	alt_port->mode = mode;
+-	alt_port->hpd_state = hpd_state;
+-	alt_port->hpd_irq = hpd_irq;
++	pmic_glink_alt_port_irq_set_data(alt_port, &alt_data);
+ 	schedule_work(&alt_port->work);
+ }
+ 
+@@ -473,6 +508,7 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
+ 					       u16 svid, const void *data, size_t len)
+ {
+ 	struct pmic_glink_altmode_port *alt_port;
++	struct pmic_glink_altmode_port_data alt_data = { };
+ 	const struct usbc_sc8280x_tbt_data *tbt;
+ 	const struct usbc_sc8280x_dp_data *dp;
+ 	const struct usbc_notify *notify;
+@@ -495,24 +531,25 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
+ 		return;
+ 	}
+ 
+-	alt_port = &altmode->ports[port];
+-	alt_port->orientation = pmic_glink_altmode_orientation(orientation);
+-	alt_port->svid = svid;
+-	alt_port->mux_ctrl = notify->mux_ctrl;
++	alt_data.orientation = pmic_glink_altmode_orientation(orientation);
++	alt_data.svid = svid;
++	alt_data.mux_ctrl = notify->mux_ctrl;
+ 
+ 	if (svid == USB_TYPEC_DP_SID) {
+ 		dp = &notify->extended_data.dp;
+ 
+-		alt_port->mode = dp->pin_assignment - DPAM_HPD_A;
+-		alt_port->hpd_state = dp->hpd_state;
+-		alt_port->hpd_irq = dp->hpd_irq;
+-	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
++		alt_data.mode = dp->pin_assignment - DPAM_HPD_A;
++		alt_data.hpd_state = dp->hpd_state;
++		alt_data.hpd_irq = dp->hpd_irq;
++	} else if (alt_data.mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
+ 		/* Valid for both USB4 and TBT3 */
+ 		tbt = &notify->extended_data.tbt;
+ 
+-		alt_port->tbt_data = *tbt;
++		alt_data.tbt_data = *tbt;
+ 	}
+ 
++	alt_port = &altmode->ports[port];
++	pmic_glink_alt_port_irq_set_data(alt_port, &alt_data);
+ 	schedule_work(&alt_port->work);
+ }
+ 
+@@ -626,6 +663,7 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
+ 		alt_port = &altmode->ports[port];
+ 		alt_port->altmode = altmode;
+ 		alt_port->index = port;
++		spin_lock_init(&alt_port->work_irq_lock);
+ 		INIT_WORK(&alt_port->work, pmic_glink_altmode_worker);
+ 
+ 		alt_port->bridge = devm_drm_dp_hpd_bridge_alloc(dev, to_of_node(fwnode));
+-- 
+2.55.0
+

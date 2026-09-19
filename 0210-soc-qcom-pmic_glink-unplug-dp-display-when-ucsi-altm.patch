@@ -1,0 +1,134 @@
+From c5ff8c02a77a7626f564ae9445a4edfffa1ab848 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 6 Oct 2026 02:34:25 -0300
+Subject: [PATCH 210/219] soc: qcom: pmic_glink: unplug dp display when ucsi
+ altmode is unset
+
+When altmode handshake fails (dp connection shows up as billboard device),
+no pmic event is generated, and the dp display is not unplugged.
+The dangling display may hang the device if modeset is attempted.
+
+ucsi will receive a connector_status event in such a scenario.
+Add plumbing to call hpd_notify with status disconnected in this case.
+---
+ drivers/soc/qcom/pmic_glink.c         |  7 +++++++
+ drivers/soc/qcom/pmic_glink_altmode.c | 24 ++++++++++++++++++++++++
+ drivers/usb/typec/ucsi/ucsi_glink.c   |  8 ++++++++
+ include/linux/soc/qcom/pmic_glink.h   |  3 +++
+ 4 files changed, 42 insertions(+)
+
+diff --git a/drivers/soc/qcom/pmic_glink.c b/drivers/soc/qcom/pmic_glink.c
+index 3042261578aa..380141f58aa0 100644
+--- a/drivers/soc/qcom/pmic_glink.c
++++ b/drivers/soc/qcom/pmic_glink.c
+@@ -118,6 +118,13 @@ void pmic_glink_client_register(struct pmic_glink_client *client)
+ }
+ EXPORT_SYMBOL_GPL(pmic_glink_client_register);
+ 
++void pmic_glink_noaltmode_notify(struct device *dev, unsigned port)
++{
++	struct pmic_glink *pg = dev_get_drvdata(dev);
++	pmic_glink_noaltmode_listener(&pg->altmode_aux, port);
++}
++EXPORT_SYMBOL_GPL(pmic_glink_noaltmode_notify);
++
+ int pmic_glink_send(struct pmic_glink_client *client, void *data, size_t len)
+ {
+ 	struct pmic_glink *pg = client->pg;
+diff --git a/drivers/soc/qcom/pmic_glink_altmode.c b/drivers/soc/qcom/pmic_glink_altmode.c
+index 3387c9ec926c..77e90673f440 100644
+--- a/drivers/soc/qcom/pmic_glink_altmode.c
++++ b/drivers/soc/qcom/pmic_glink_altmode.c
+@@ -120,6 +120,7 @@ struct pmic_glink_altmode_port {
+ 	struct typec_altmode tbt_alt;
+ 
+ 	spinlock_t work_irq_lock;
++	struct mutex work_lock;
+ 	struct work_struct work;
+ 
+ 	enum drm_connector_status conn_status;
+@@ -379,6 +380,8 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
+ 	struct pmic_glink_altmode_port_data alt_data;
+ 	enum drm_connector_status conn_status;
+ 
++	guard(mutex)(&alt_port->work_lock);
++
+ 	pmic_glink_alt_port_worker_get_data(alt_port, &alt_data);
+ 
+ 	typec_switch_set(alt_port->typec_switch, alt_data.orientation);
+@@ -609,6 +612,25 @@ static void pmic_glink_altmode_pdr_notify(void *priv, int state)
+ 		schedule_work(&altmode->enable_work);
+ }
+ 
++void pmic_glink_noaltmode_listener(struct auxiliary_device *adev, unsigned port)
++{
++	struct pmic_glink_altmode *altmode = dev_get_drvdata(&adev->dev);
++	struct pmic_glink_altmode_port *alt_port;
++	struct pmic_glink_altmode_port_data alt_data = { };
++
++	if (port >= ARRAY_SIZE(altmode->ports) || !altmode->ports[port].altmode)
++		return;
++
++	alt_port = &altmode->ports[port];
++	guard(mutex)(&alt_port->work_lock);
++
++	/* reset data to safe */
++	pmic_glink_alt_port_irq_set_data(alt_port, &alt_data);
++
++	pmic_glink_altmode_port_set_conn_status(alt_port, connector_status_disconnected);
++}
++EXPORT_SYMBOL_GPL(pmic_glink_noaltmode_listener);
++
+ static const struct of_device_id pmic_glink_altmode_of_quirks[] = {
+ 	{ .compatible = "qcom,sc8180x-pmic-glink", .data = (void *)PMIC_GLINK_OWNER_USBC },
+ 	{}
+@@ -664,6 +686,7 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
+ 		alt_port->altmode = altmode;
+ 		alt_port->index = port;
+ 		spin_lock_init(&alt_port->work_irq_lock);
++		mutex_init(&alt_port->work_lock);
+ 		INIT_WORK(&alt_port->work, pmic_glink_altmode_worker);
+ 
+ 		alt_port->bridge = devm_drm_dp_hpd_bridge_alloc(dev, to_of_node(fwnode));
+@@ -745,6 +768,7 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
+ 		return PTR_ERR(altmode->client);
+ 
+ 	pmic_glink_client_register(altmode->client);
++	dev_set_drvdata(dev, altmode);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/usb/typec/ucsi/ucsi_glink.c b/drivers/usb/typec/ucsi/ucsi_glink.c
+index 12e07b9fe622..a75f7145191d 100644
+--- a/drivers/usb/typec/ucsi/ucsi_glink.c
++++ b/drivers/usb/typec/ucsi/ucsi_glink.c
+@@ -218,6 +218,14 @@ static void pmic_glink_ucsi_connector_status(struct ucsi_connector *con)
+ 	    !ucsi->port_orientation[con->num - 1])
+ 		return;
+ 
++	/* In case of altmode handshake failure, no pmic event is generated
++	 * and the dp display would dangle. Attempts to modeset will lead to
++	 * device hang.
++	 *
++	 * Manually disconnect the dp display by listening to ucsi event. */
++	if (!UCSI_CONSTAT(con, PARTNER_FLAG_ALT_MODE))
++		pmic_glink_noaltmode_notify(ucsi->dev->parent, con->num - 1);
++
+ 	orientation = gpiod_get_value(ucsi->port_orientation[con->num - 1]);
+ 	if (orientation >= 0) {
+ 		typec_set_orientation(con->port,
+diff --git a/include/linux/soc/qcom/pmic_glink.h b/include/linux/soc/qcom/pmic_glink.h
+index 7cddf1027752..d9bee3d03777 100644
+--- a/include/linux/soc/qcom/pmic_glink.h
++++ b/include/linux/soc/qcom/pmic_glink.h
+@@ -30,4 +30,7 @@ struct pmic_glink_client *devm_pmic_glink_client_alloc(struct device *dev,
+ 						       void *priv);
+ void pmic_glink_client_register(struct pmic_glink_client *client);
+ 
++void pmic_glink_noaltmode_listener(struct auxiliary_device *adev, unsigned port);
++void pmic_glink_noaltmode_notify(struct device *dev, unsigned port);
++
+ #endif
+-- 
+2.55.0
+

@@ -1,0 +1,77 @@
+From 8351d077b1c09995b9db369524a3b93720ef05ce Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Mon, 5 Oct 2026 11:18:56 -0300
+Subject: [PATCH 204/219] drm/bridge: Add flag to allow hpd_notify to be
+ skipped after detect.
+
+Useful when bridge_detect is not the source of truth for hpd, and would
+otherwise race.
+---
+ drivers/gpu/drm/display/drm_bridge_connector.c | 17 ++++++++++++++---
+ include/drm/drm_bridge.h                       |  7 +++++++
+ 2 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/display/drm_bridge_connector.c b/drivers/gpu/drm/display/drm_bridge_connector.c
+index 649969fca141..af2265ce0a4d 100644
+--- a/drivers/gpu/drm/display/drm_bridge_connector.c
++++ b/drivers/gpu/drm/display/drm_bridge_connector.c
+@@ -131,6 +131,14 @@ struct drm_bridge_connector {
+ 	 * bridge connector.
+ 	 */
+ 	struct drm_connector_hdmi_funcs hdmi_funcs;
++
++	/**
++	 * @detect_no_hpd:
++	 *
++	 * Whether to skip hpd_notify when bridge_detect is called.
++	 * Determined by DRM_BRIDGE_OP_DETECT_NO_HPD.
++	 */
++	bool detect_no_hpd;
+ };
+ 
+ #define to_drm_bridge_connector(x) \
+@@ -220,10 +228,12 @@ drm_bridge_connector_detect(struct drm_connector *connector, bool force)
+ 	if (detect) {
+ 		status = detect->funcs->detect(detect, connector);
+ 
+-		if (hdmi)
+-			drm_atomic_helper_connector_hdmi_hotplug(connector, status);
++		if (!bridge_connector->detect_no_hpd) {
++			if (hdmi)
++				drm_atomic_helper_connector_hdmi_hotplug(connector, status);
+ 
+-		drm_bridge_connector_hpd_notify(connector, status);
++			drm_bridge_connector_hpd_notify(connector, status);
++		}
+ 	} else {
+ 		switch (connector->connector_type) {
+ 		case DRM_MODE_CONNECTOR_DPI:
+@@ -850,6 +860,7 @@ struct drm_connector *drm_bridge_connector_init(struct drm_device *drm,
+ 		if (bridge->ops & DRM_BRIDGE_OP_DETECT) {
+ 			drm_bridge_put(bridge_connector->bridge_detect);
+ 			bridge_connector->bridge_detect = drm_bridge_get(bridge);
++			bridge_connector->detect_no_hpd = !!(bridge->ops & DRM_BRIDGE_OP_DETECT_NO_HPD);
+ 		}
+ 		if (bridge->ops & DRM_BRIDGE_OP_HDMI) {
+ 			if (bridge_connector->bridge_hdmi)
+diff --git a/include/drm/drm_bridge.h b/include/drm/drm_bridge.h
+index 4ba3a5deef9a..62416bbb878a 100644
+--- a/include/drm/drm_bridge.h
++++ b/include/drm/drm_bridge.h
+@@ -1092,6 +1092,13 @@ enum drm_bridge_ops {
+ 	 * &drm_bridge_funcs->hdmi_clear_spd_infoframe callbacks.
+ 	 */
+ 	DRM_BRIDGE_OP_HDMI_SPD_INFOFRAME = BIT(10),
++	/**
++	 * @DRM_BRIDGE_OP_DETECT_NO_HPD: The bridge will skip hpd_notify
++	 * when bridge_detect is called.
++	 * Set when bridge_detect is not the source of truth for HPD
++	 * in order to avoid race.
++	 */
++	DRM_BRIDGE_OP_DETECT_NO_HPD = BIT(11),
+ };
+ 
+ /**
+-- 
+2.55.0
+

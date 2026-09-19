@@ -1,0 +1,139 @@
+From 71e8a1d5defe305ce34810b4d1bc785d9e595ede Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Mon, 5 Oct 2026 11:31:32 -0300
+Subject: [PATCH 206/219] drm/msm/dp: guard dp phy init with plugged state and
+ simplify bridge_detect
+
+There's no guarantee that msm_dp_hpd_plug_handle will be called in pairs
+with msm_dp_hpd_unplug_handle from either internal hpd or pmic_glink.
+
+Guard the call to resume dp dev to avoid unbalanced pm resume and suspend.
+
+Similar problem exists in bridge_detect; since that function isn't used as
+the source of truth for hpd, simplify it instead.
+---
+ drivers/gpu/drm/msm/dp/dp_display.c | 85 ++++-------------------------
+ 1 file changed, 12 insertions(+), 73 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 22eade11c615..fdeef52fd2ab 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -400,15 +400,19 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 
+ 	guard(mutex)(&dp->plugged_lock);
+ 
+-	ret = pm_runtime_resume_and_get(&pdev->dev);
+-	if (ret) {
+-		DRM_ERROR("failed to pm_runtime_resume\n");
+-		return ret;
+-	}
++	if (!dp->plugged) {
++		ret = pm_runtime_resume_and_get(&pdev->dev);
++		if (ret) {
++			DRM_ERROR("failed to pm_runtime_resume\n");
++			return ret;
++		}
+ 
+-	msm_dp_aux_enable_xfers(dp->aux, true);
++		msm_dp_aux_enable_xfers(dp->aux, true);
+ 
+-	msm_dp_display_host_phy_init(dp);
++		msm_dp_display_host_phy_init(dp);
++
++		dp->plugged = true;
++	}
+ 
+ 	ret = msm_dp_display_process_hpd_high(dp);
+ 
+@@ -416,8 +420,6 @@ static int msm_dp_hpd_plug_handle(struct msm_dp_display_private *dp)
+ 			dp->msm_dp_display.connector_type,
+ 			dp->link->sink_count);
+ 
+-	dp->plugged = true;
+-
+ 	return ret;
+ };
+ 
+@@ -836,77 +838,14 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
+ {
+ 	struct msm_dp_bridge *msm_dp_bridge = to_dp_bridge(bridge);
+ 	struct msm_dp *dp = msm_dp_bridge->msm_dp_display;
+-	int status = connector_status_disconnected;
+ 	struct msm_dp_display_private *priv;
+-	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+-	struct drm_dp_desc desc;
+-	bool phy_deinit;
+-	int ret;
+ 
+ 	dp = to_dp_bridge(bridge)->msm_dp_display;
+ 
+ 	priv = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 
+ 	guard(mutex)(&priv->plugged_lock);
+-	ret = pm_runtime_resume_and_get(&dp->pdev->dev);
+-	if (ret) {
+-		DRM_ERROR("failed to pm_runtime_resume\n");
+-		return status;
+-	}
+-
+-	phy_deinit = msm_dp_display_host_phy_init(priv);
+-
+-	msm_dp_aux_enable_xfers(priv->aux, true);
+-
+-	ret = msm_dp_aux_is_link_connected(priv->aux);
+-	DRM_DEBUG_DP("aux link status: %x\n", ret);
+-	if (!priv->plugged && !ret) {
+-		DRM_DEBUG_DP("aux not connected\n");
+-		priv->plugged = false;
+-		goto end;
+-	}
+-
+-	ret = drm_dp_read_dpcd_caps(priv->aux, dpcd);
+-	if (ret) {
+-		DRM_DEBUG_DP("failed to read caps\n");
+-		priv->plugged = false;
+-		goto end;
+-	}
+-
+-	ret = drm_dp_read_desc(priv->aux, &desc, drm_dp_is_branch(dpcd));
+-	if (ret) {
+-		DRM_DEBUG_DP("failed to read desc\n");
+-		priv->plugged = false;
+-		goto end;
+-	}
+-
+-	status = connector_status_connected;
+-	priv->plugged = true;
+-
+-	if (drm_dp_read_sink_count_cap(connector, dpcd, &desc)) {
+-		int sink_count = drm_dp_read_sink_count(priv->aux);
+-
+-		drm_dbg_dp(dp->drm_dev, "sink_count = %d\n", sink_count);
+-
+-		if (sink_count <= 0)
+-			status = connector_status_disconnected;
+-	}
+-
+-end:
+-	/*
+-	 * If we detected the DPRX, leave the controller on so that it doesn't
+-	 * lose the state.
+-	 */
+-	if (!priv->plugged) {
+-		if (phy_deinit) {
+-			msm_dp_aux_enable_xfers(priv->aux, false);
+-			msm_dp_display_host_phy_exit(priv);
+-		}
+-
+-		pm_runtime_put_sync(&dp->pdev->dev);
+-	}
+-
+-	return status;
++	return priv->plugged ? connector_status_connected : connector_status_disconnected;
+ }
+ 
+ static irqreturn_t msm_dp_display_irq_handler(int irq, void *dev_id)
+-- 
+2.55.0
+

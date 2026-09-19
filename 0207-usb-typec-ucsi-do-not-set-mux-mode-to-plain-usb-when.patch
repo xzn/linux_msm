@@ -1,0 +1,30 @@
+From bdaade4372dff8159af5965e854af66cc850c300 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Mon, 5 Oct 2026 11:40:10 -0300
+Subject: [PATCH 207/219] usb: typec: ucsi: do not set mux mode to plain usb
+ when altmode is present
+
+Fix regression introduced in 226ff2e
+where the condition was changed from if only FLAG_USB is present, to if
+FLAG_USB is present at all, ignoring the state of FLAG_ALT_MODE.
+---
+ drivers/usb/typec/ucsi/ucsi.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/typec/ucsi/ucsi.c b/drivers/usb/typec/ucsi/ucsi.c
+index 49f1c53721bb..595256abcadb 100644
+--- a/drivers/usb/typec/ucsi/ucsi.c
++++ b/drivers/usb/typec/ucsi/ucsi.c
+@@ -1355,7 +1355,8 @@ static void ucsi_partner_change(struct ucsi_connector *con)
+ 			typec_set_mode(con->port, TYPEC_MODE_AUDIO);
+ 			break;
+ 		default:
+-			if (UCSI_CONSTAT(con, PARTNER_FLAG_USB))
++			if (UCSI_CONSTAT(con, PARTNER_FLAG_USB) &&
++			    !UCSI_CONSTAT(con, PARTNER_FLAG_ALT_MODE))
+ 				typec_set_mode(con->port, TYPEC_STATE_USB);
+ 		}
+ 
+-- 
+2.55.0
+

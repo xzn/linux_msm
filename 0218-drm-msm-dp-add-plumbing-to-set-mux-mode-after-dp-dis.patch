@@ -1,0 +1,370 @@
+From de7534d2316e02319847770c002c6698fad25ab2 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 6 Oct 2026 03:08:22 -0300
+Subject: [PATCH 218/219] drm/msm/dp: add plumbing to set mux mode after dp
+ display disable
+
+Setting mux mode from pmic_glink usually fails due to dp display being in use.
+Add plumbing to call associated pmic_glink port (if any) mux mode set
+when dp display is disabled.
+
+Change hpd notify disconnect call to be before mux mode set instead of after,
+to ensure mux mode set succeeds in case no mode set has happened.
+---
+ drivers/gpu/drm/msm/dp/dp_display.c     | 34 +++++++++
+ drivers/soc/qcom/pmic_glink.c           | 91 +++++++++++++++++++++++++
+ drivers/soc/qcom/pmic_glink_altmode.c   | 91 +++++++++++++++++--------
+ include/linux/soc/qcom/pmic_glink.h     |  4 ++
+ include/linux/soc/qcom/pmic_glink_mux.h | 12 ++++
+ 5 files changed, 203 insertions(+), 29 deletions(-)
+ create mode 100644 include/linux/soc/qcom/pmic_glink_mux.h
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 1f85bdd1baea..ba5d6370fe79 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -12,6 +12,7 @@
+ #include <linux/phy/phy.h>
+ #include <linux/delay.h>
+ #include <linux/string_choices.h>
++#include <linux/soc/qcom/pmic_glink_mux.h>
+ #include <drm/display/drm_dp_aux_bus.h>
+ #include <drm/display/drm_hdmi_audio_helper.h>
+ #include <drm/drm_edid.h>
+@@ -83,6 +84,10 @@ struct msm_dp_display_private {
+ 	/* wait for audio signaling */
+ 	struct completion audio_comp;
+ 
++	/* pmic_glink device for mux notify if present */
++	struct device *pmic_glink;
++	unsigned pmic_glink_port;
++
+ 	/* HPD IRQ handling */
+ 	spinlock_t irq_thread_lock;
+ 	u32 hpd_isr_status;
+@@ -695,6 +700,25 @@ static int msm_dp_display_post_enable(struct msm_dp *msm_dp_display)
+ 	return 0;
+ }
+ 
++static void msm_dp_display_pmic_glink_notify(struct msm_dp_display_private *dp)
++{
++	if (dp->pmic_glink) {
++		if (IS_ERR(dp->pmic_glink) && PTR_ERR(dp->pmic_glink) == -EPROBE_DEFER) {
++			dp->pmic_glink = fwnode_pmic_glink_probe_device_port(dev_fwnode(&dp->msm_dp_display.pdev->dev),
++									     &dp->pmic_glink_port);
++
++			if (!IS_ERR_OR_NULL(dp->pmic_glink))
++				DRM_INFO("pmic_glink %s port %u (deferred) connected to dp display\n",
++					 dev_name(dp->pmic_glink), dp->pmic_glink_port);
++		}
++
++		if (!IS_ERR_OR_NULL(dp->pmic_glink))
++			pmic_glink_mux_notify(dp->pmic_glink, dp->pmic_glink_port);
++		else
++			DRM_ERROR("pmic_glink probe from dp display failed\n");
++	}
++}
++
+ static int msm_dp_display_disable(struct msm_dp_display_private *dp)
+ {
+ 	struct msm_dp *msm_dp_display = &dp->msm_dp_display;
+@@ -730,6 +754,11 @@ static int msm_dp_display_disable(struct msm_dp_display_private *dp)
+ 
+ 	msm_dp_display->power_on = false;
+ 
++	/* This is a good opportunity to notify pmic glink to set mux mode.
++	 * dp phy is powered off so there should be no interference.
++	 * Otherwise mux mode may dangle leading to device hang. */
++	msm_dp_display_pmic_glink_notify(dp);
++
+ 	if (dp->plugged_pending == PLUGGED_PENDING_CONNECT) {
+ 		/* reset before calling plug_handle */
+ 		dp->plugged_pending = PLUGGED_PENDING_NONE;
+@@ -1203,6 +1232,11 @@ static int msm_dp_display_probe(struct platform_device *pdev)
+ 	if (rc)
+ 		return rc;
+ 
++	dp->pmic_glink = fwnode_pmic_glink_probe_device_port(dev_fwnode(&pdev->dev),
++							     &dp->pmic_glink_port);
++	if (!IS_ERR_OR_NULL(dp->pmic_glink))
++		DRM_INFO("pmic_glink %s port %u connected to dp display\n", dev_name(dp->pmic_glink), dp->pmic_glink_port);
++
+ 	rc = msm_dp_init_sub_modules(dp);
+ 	if (rc) {
+ 		DRM_ERROR("init sub module failed\n");
+diff --git a/drivers/soc/qcom/pmic_glink.c b/drivers/soc/qcom/pmic_glink.c
+index 380141f58aa0..f26fae947926 100644
+--- a/drivers/soc/qcom/pmic_glink.c
++++ b/drivers/soc/qcom/pmic_glink.c
+@@ -125,6 +125,97 @@ void pmic_glink_noaltmode_notify(struct device *dev, unsigned port)
+ }
+ EXPORT_SYMBOL_GPL(pmic_glink_noaltmode_notify);
+ 
++void pmic_glink_mux_notify(struct device *dev, unsigned port)
++{
++	struct pmic_glink *pg = dev_get_drvdata(dev);
++	pmic_glink_mux_listener(&pg->altmode_aux, port);
++}
++EXPORT_SYMBOL_GPL(pmic_glink_mux_notify);
++
++/* Allow matching indirectly from e.g. redriver */
++#define PMIC_LINK_MATCH_DEPTH 3
++struct pmic_link_match_data {
++	unsigned depth;
++	const struct fwnode_handle *fwnodes[PMIC_LINK_MATCH_DEPTH];
++
++	unsigned port;
++};
++
++static struct device *fwnode_pmic_glink_match(struct pmic_link_match_data *data);
++
++static struct device *pmic_glink_match(const struct fwnode_handle *conn_fwnode,
++			      struct pmic_link_match_data *data)
++{
++	struct device *dev = NULL;
++	struct fwnode_handle *pmic_glink_fwnode = fwnode_get_parent(conn_fwnode);
++	int ret;
++
++	bool is_pmic_glink = fwnode_device_is_compatible(pmic_glink_fwnode, "qcom,pmic-glink");
++	if (is_pmic_glink) {
++		dev = bus_find_device_by_fwnode(&platform_bus_type, pmic_glink_fwnode);
++		if (!dev)
++			dev = ERR_PTR(-EPROBE_DEFER);
++		else {
++			ret = fwnode_property_read_u32(conn_fwnode, "reg", &data->port);
++			if (ret < 0) {
++				put_device(dev);
++				dev = NULL;
++			}
++		}
++	} else {
++		if (data->depth++ < PMIC_LINK_MATCH_DEPTH) {
++			data->fwnodes[data->depth] = conn_fwnode;
++			dev = fwnode_pmic_glink_match(data);
++		}
++
++		data->depth--;
++	}
++
++	fwnode_handle_put(pmic_glink_fwnode);
++	return dev;
++}
++
++static struct device *fwnode_pmic_glink_match(struct pmic_link_match_data *data)
++{
++	const struct fwnode_handle *fwnode = data->fwnodes[data->depth];
++	struct fwnode_handle *ep;
++	struct fwnode_handle *node;
++	struct device *dev = NULL;
++
++	fwnode_graph_for_each_endpoint(fwnode, ep) {
++		node = fwnode_graph_get_remote_port_parent(ep);
++
++		if (data->depth && data->fwnodes[data->depth - 1] == node) {
++			fwnode_handle_put(node);
++			continue;
++		}
++
++		dev = pmic_glink_match(node, data);
++		fwnode_handle_put(node);
++		if (dev) {
++			fwnode_handle_put(ep);
++			break;
++		}
++	}
++
++	return dev;
++}
++
++struct device *fwnode_pmic_glink_probe_device_port(const struct fwnode_handle *fwnode,
++						   unsigned *port)
++{
++	struct pmic_link_match_data data = {
++		.fwnodes = { fwnode },
++	};
++	struct device *dev = fwnode_pmic_glink_match(&data);
++	if (IS_ERR_OR_NULL(dev))
++		*port = 0;
++	else
++		*port = data.port;
++	return dev;
++}
++EXPORT_SYMBOL_GPL(fwnode_pmic_glink_probe_device_port);
++
+ int pmic_glink_send(struct pmic_glink_client *client, void *data, size_t len)
+ {
+ 	struct pmic_glink *pg = client->pg;
+diff --git a/drivers/soc/qcom/pmic_glink_altmode.c b/drivers/soc/qcom/pmic_glink_altmode.c
+index 2d3297b5242c..53d07c87c1d1 100644
+--- a/drivers/soc/qcom/pmic_glink_altmode.c
++++ b/drivers/soc/qcom/pmic_glink_altmode.c
+@@ -373,59 +373,74 @@ static void pmic_glink_alt_port_worker_get_data(struct pmic_glink_altmode_port *
+ 	spin_unlock_irqrestore(&alt_port->work_irq_lock, flags);
+ }
+ 
+-static void pmic_glink_altmode_worker(struct work_struct *work)
++static void pmic_glink_altmode_port_work(struct pmic_glink_altmode_port *alt_port,
++					 struct pmic_glink_altmode_port_data *alt_data)
+ {
+-	struct pmic_glink_altmode_port *alt_port = work_to_altmode_port(work);
+ 	struct pmic_glink_altmode *altmode = alt_port->altmode;
+-	struct pmic_glink_altmode_port_data alt_data;
+-	enum drm_connector_status conn_status;
+-
+-	guard(mutex)(&alt_port->work_lock);
+ 
+-	pmic_glink_alt_port_worker_get_data(alt_port, &alt_data);
+-
+-	typec_switch_set(alt_port->typec_switch, alt_data.orientation);
++	typec_switch_set(alt_port->typec_switch, alt_data->orientation);
+ 
+ 	/*
+ 	 * MUX_CTRL_STATE_DP4LN/USB3_DP may only be set if SVID=DP, but we need
+ 	 * to special-case the SVID=DP && mux_ctrl=NO_CONN case to deliver a
+ 	 * HPD notification
+ 	 */
+-	if (alt_data.svid == USB_TYPEC_DP_SID) {
+-		if (alt_data.mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
++	if (alt_data->svid == USB_TYPEC_DP_SID) {
++		if (alt_data->mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
+ 			pmic_glink_altmode_safe(altmode, alt_port);
+ 		} else {
+ 			pmic_glink_altmode_enable_dp(altmode, alt_port,
+-						     alt_data.mode,
+-						     alt_data.hpd_state,
+-						     alt_data.hpd_irq);
++						     alt_data->mode,
++						     alt_data->hpd_state,
++						     alt_data->hpd_irq);
+ 		}
+-
+-		if (alt_data.hpd_state)
+-			conn_status = connector_status_connected;
+-		else
+-			conn_status = connector_status_disconnected;
+-
+-		pmic_glink_altmode_port_set_conn_status(alt_port, conn_status);
+-	} else if (alt_data.mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
+-		if (alt_data.svid == USB_TYPEC_TBT_SID)
++	} else if (alt_data->mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
++		if (alt_data->svid == USB_TYPEC_TBT_SID)
+ 			pmic_glink_altmode_enable_tbt(altmode,
+ 						      alt_port,
+-						      &alt_data.tbt_data,
+-						      alt_data.mode);
++						      &alt_data->tbt_data,
++						      alt_data->mode);
+ 		else
+ 			pmic_glink_altmode_enable_usb4(altmode,
+ 						       alt_port,
+-						       &alt_data.tbt_data);
+-	} else if (alt_data.mux_ctrl == MUX_CTRL_STATE_USB3_ONLY) {
++						       &alt_data->tbt_data);
++	} else if (alt_data->mux_ctrl == MUX_CTRL_STATE_USB3_ONLY) {
+ 		pmic_glink_altmode_enable_usb(altmode, alt_port);
+-	} else if (alt_data.mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
++	} else if (alt_data->mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
+ 		pmic_glink_altmode_safe(altmode, alt_port);
+ 	} else {
+ 		dev_err(altmode->dev, "Got unknown mux_ctrl: %u on port %u, forcing safe mode\n",
+-			alt_data.mux_ctrl, alt_port->index);
++			alt_data->mux_ctrl, alt_port->index);
+ 		pmic_glink_altmode_safe(altmode, alt_port);
+ 	}
++}
++
++static void pmic_glink_altmode_worker(struct work_struct *work)
++{
++	struct pmic_glink_altmode_port *alt_port = work_to_altmode_port(work);
++	struct pmic_glink_altmode *altmode = alt_port->altmode;
++	struct pmic_glink_altmode_port_data alt_data;
++
++	guard(mutex)(&alt_port->work_lock);
++
++	pmic_glink_alt_port_worker_get_data(alt_port, &alt_data);
++
++	if (alt_data.svid == USB_TYPEC_DP_SID &&
++	    alt_data.mux_ctrl != MUX_CTRL_STATE_NO_CONN) {
++		/* disconnect dp display before setting mux */
++		if (!alt_data.hpd_state)
++			pmic_glink_altmode_port_set_conn_status(alt_port, connector_status_disconnected);
++
++		pmic_glink_altmode_port_work(alt_port, &alt_data);
++
++		/* connect dp display after setting mux */
++		if (alt_data.hpd_state)
++			pmic_glink_altmode_port_set_conn_status(alt_port, connector_status_connected);
++
++	} else {
++		pmic_glink_altmode_port_set_conn_status(alt_port, connector_status_disconnected);
++		pmic_glink_altmode_port_work(alt_port, &alt_data);
++	}
+ 
+ 	pmic_glink_altmode_request(altmode, ALTMODE_PAN_ACK, alt_port->index);
+ }
+@@ -640,6 +655,24 @@ void pmic_glink_noaltmode_listener(struct auxiliary_device *adev, unsigned port)
+ }
+ EXPORT_SYMBOL_GPL(pmic_glink_noaltmode_listener);
+ 
++void pmic_glink_mux_listener(struct auxiliary_device *adev, unsigned port)
++{
++	struct pmic_glink_altmode *altmode = dev_get_drvdata(&adev->dev);
++	struct pmic_glink_altmode_port *alt_port;
++	struct pmic_glink_altmode_port_data alt_data;
++
++	if (port >= ARRAY_SIZE(altmode->ports) || !altmode->ports[port].altmode)
++		return;
++
++	alt_port = &altmode->ports[port];
++	guard(mutex)(&alt_port->work_lock);
++
++	pmic_glink_alt_port_worker_get_data(alt_port, &alt_data);
++
++	pmic_glink_altmode_port_work(alt_port, &alt_data);
++}
++EXPORT_SYMBOL_GPL(pmic_glink_mux_listener);
++
+ static const struct of_device_id pmic_glink_altmode_of_quirks[] = {
+ 	{ .compatible = "qcom,sc8180x-pmic-glink", .data = (void *)PMIC_GLINK_OWNER_USBC },
+ 	{}
+diff --git a/include/linux/soc/qcom/pmic_glink.h b/include/linux/soc/qcom/pmic_glink.h
+index d9bee3d03777..a9ab694befb0 100644
+--- a/include/linux/soc/qcom/pmic_glink.h
++++ b/include/linux/soc/qcom/pmic_glink.h
+@@ -5,6 +5,8 @@
+ #ifndef __SOC_QCOM_PMIC_GLINK_H__
+ #define __SOC_QCOM_PMIC_GLINK_H__
+ 
++#include <linux/soc/qcom/pmic_glink_mux.h>
++
+ struct pmic_glink;
+ struct pmic_glink_client;
+ 
+@@ -33,4 +35,6 @@ void pmic_glink_client_register(struct pmic_glink_client *client);
+ void pmic_glink_noaltmode_listener(struct auxiliary_device *adev, unsigned port);
+ void pmic_glink_noaltmode_notify(struct device *dev, unsigned port);
+ 
++void pmic_glink_mux_listener(struct auxiliary_device *adev, unsigned port);
++
+ #endif
+diff --git a/include/linux/soc/qcom/pmic_glink_mux.h b/include/linux/soc/qcom/pmic_glink_mux.h
+new file mode 100644
+index 000000000000..60371c726bb3
+--- /dev/null
++++ b/include/linux/soc/qcom/pmic_glink_mux.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (c) 2022, Linaro Ltd
++ */
++#ifndef __SOC_QCOM_PMIC_GLINK_MUX_H__
++#define __SOC_QCOM_PMIC_GLINK_MUX_H__
++
++void pmic_glink_mux_notify(struct device *dev, unsigned port);
++struct device *fwnode_pmic_glink_probe_device_port(const struct fwnode_handle *fwnode,
++						   unsigned *port);
++
++#endif
+-- 
+2.55.0
+
