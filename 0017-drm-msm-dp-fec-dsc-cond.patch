@@ -1,0 +1,213 @@
+From f7dcabacb2088d3b6b1587dc6113524ba8fcecb1 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Sun, 27 Sep 2026 05:52:01 -0300
+Subject: [PATCH 17/17] drm/msm/dp: fec dsc cond
+
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c  | 44 ++++++++++++++++++++-----------
+ drivers/gpu/drm/msm/dp/dp_debug.c |  2 --
+ drivers/gpu/drm/msm/dp/dp_panel.c | 29 ++++++++++----------
+ drivers/gpu/drm/msm/dp/dp_panel.h |  1 -
+ 4 files changed, 43 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 6ff021259a92..f4a5c60d2e2e 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -985,7 +985,8 @@ static void msm_dp_ctrl_host_fec_start(struct msm_dp_ctrl_private *ctrl)
+ 	u8 fec_sts = 0;
+ 	int i, max_retries = 3;
+ 	bool fec_en = ctrl->panel->fec_cap.enabled;
+-	bool fec_en_detected;
++	bool fec_detected;
++	int fec_mask = fec_en ? DP_FEC_DECODE_EN_DETECTED : DP_FEC_DECODE_DIS_DETECTED;
+ 
+ 	/* Need to try to enable multiple times due to BS symbols collisions */
+ 	for (i = 0; i < max_retries; i++) {
+@@ -996,16 +997,16 @@ static void msm_dp_ctrl_host_fec_start(struct msm_dp_ctrl_private *ctrl)
+ 
+ 		/* read back FEC status and check if it is enabled */
+ 		drm_dp_dpcd_readb(ctrl->aux, DP_FEC_STATUS, &fec_sts);
+-		fec_en_detected = !!(fec_sts & DP_FEC_DECODE_EN_DETECTED);
++		fec_detected = !!(fec_sts & fec_mask);
+ 
+-		if (fec_en_detected == fec_en)
++		if (fec_detected)
+ 			break;
+ 	}
+ 
+-	drm_dbg_dp(ctrl->drm_dev, "retries %d, fec_en_detected %d\n",
+-				i, fec_en_detected);
++	drm_dbg_dp(ctrl->drm_dev, "retries %d, fec_en %d\n",
++				i, fec_en);
+ 
+-	if (fec_en_detected != fec_en)
++	if (!fec_detected) {
+ 		DRM_ERROR("failed to set sink fec\n");
+ }
+ 
+@@ -1036,7 +1037,8 @@ static int msm_dp_ctrl_setup_main_link(struct msm_dp_ctrl_private *ctrl,
+ 	if (ctrl->link->sink_request & DP_TEST_LINK_PHY_TEST_PATTERN)
+ 		return ret;
+ 
+-	msm_dp_ctrl_sink_fec_enable(ctrl, ctrl->panel->fec_cap.enabled);
++	if (ctrl->panel->fec_cap.supported)
++		msm_dp_ctrl_sink_fec_enable(ctrl, ctrl->panel->fec_cap.enabled);
+ 
+ 	/*
+ 	 * As part of previous calls, DP controller state might have
+@@ -2018,13 +2020,18 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, bool force_link_train
+ 		pixel_rate_orig,
+ 		ctrl->panel->msm_dp_mode.out_fmt_is_yuv_420);
+ 
+-	msm_dp_ctrl_config_dsc_dto(ctrl, ctrl->panel->dsc_cap.enabled);
+-	msm_dp_ctrl_dsc_commit_pps(ctrl);
+-	msm_dp_ctrl_pps_flush(ctrl);
++	if (ctrl->panel->dsc_cap.supported) {
++		msm_dp_ctrl_config_dsc_dto(ctrl, ctrl->panel->dsc_cap.enabled);
++		msm_dp_ctrl_dsc_commit_pps(ctrl);
++		msm_dp_ctrl_pps_flush(ctrl);
++	} else {
++		msm_dp_panel_config_dsc_dto(ctrl->panel, false);
++	}
+ 
+ 	msm_dp_ctrl_setup_tr_unit(ctrl);
+ 
+-	msm_dp_panel_override_ack_dto(ctrl->panel, true);
++	if (ctrl->panel->dsc_cap.supported)
++		msm_dp_panel_override_ack_dto(ctrl->panel, true);
+ 
+ 	msm_dp_write_link(ctrl, REG_DP_STATE_CTRL, DP_STATE_CTRL_SEND_VIDEO);
+ 
+@@ -2037,8 +2044,10 @@ int msm_dp_ctrl_on_stream(struct msm_dp_ctrl *msm_dp_ctrl, bool force_link_train
+ 		"mainlink %s\n", mainlink_ready ? "READY" : "NOT READY");
+ 
+ 	/* wait for link training completion before fec config as per spec */
+-	msm_dp_ctrl_host_fec_start(ctrl);
+-	msm_dp_ctrl_sink_dsc_enable(ctrl);
++	if (ctrl->panel->fec_cap.supported)
++		msm_dp_ctrl_host_fec_start(ctrl);
++	if (ctrl->panel->dsc_cap.supported)
++		msm_dp_ctrl_sink_dsc_enable(ctrl);
+ 
+ end:
+ 	return ret;
+@@ -2084,9 +2093,12 @@ void msm_dp_ctrl_off(struct msm_dp_ctrl *msm_dp_ctrl)
+ 
+ 	msm_dp_panel_disable_vsc_sdp(ctrl->panel);
+ 
+-	msm_dp_ctrl_host_fec_stop(ctrl);
+-	msm_dp_ctrl_config_dsc_dto(ctrl, false);
+-	msm_dp_panel_override_ack_dto(ctrl->panel, false);
++	if (ctrl->panel->fec_cap.supported)
++		msm_dp_ctrl_host_fec_stop(ctrl);
++	if (ctrl->panel->dsc_cap.supported) {
++		msm_dp_ctrl_config_dsc_dto(ctrl, false);
++		msm_dp_panel_override_ack_dto(ctrl->panel, false);
++	}
+ 
+ 	msm_dp_ctrl_mainlink_disable(ctrl);
+ 
+diff --git a/drivers/gpu/drm/msm/dp/dp_debug.c b/drivers/gpu/drm/msm/dp/dp_debug.c
+index 82ab66d6826b..4bb1ee3bff2f 100644
+--- a/drivers/gpu/drm/msm/dp/dp_debug.c
++++ b/drivers/gpu/drm/msm/dp/dp_debug.c
+@@ -68,8 +68,6 @@ static int msm_dp_debug_show(struct seq_file *seq, void *p)
+ 			debug->panel->msm_dp_mode.mode_cfg.bpp);
+ 	seq_printf(seq, "\t\ttgt_bpp = %d\n",
+ 			debug->panel->msm_dp_mode.mode_cfg.tgt_bpp);
+-	seq_printf(seq, "\t\tfec = %d\n",
+-			debug->panel->msm_dp_mode.mode_cfg.fec_available);
+ 	seq_printf(seq, "\t\tdsc = %d\n",
+ 			debug->panel->msm_dp_mode.mode_cfg.dsc);
+ 
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.c b/drivers/gpu/drm/msm/dp/dp_panel.c
+index 7f897018c00e..5bf9195f68be 100644
+--- a/drivers/gpu/drm/msm/dp/dp_panel.c
++++ b/drivers/gpu/drm/msm/dp/dp_panel.c
+@@ -320,12 +320,11 @@ static u8 msm_dp_panel_get_supported_bpp_dsc(
+ }
+ 
+ static struct msm_dp_display_mode_cfg msm_dp_panel_get_cfg_from_bpp(
+-	u8 bpp, u8 dsc_bpp, enum msm_mode_dsc_cfg dsc_cfg, bool fec_en, u8 tgt_bpp)
++	u8 bpp, u8 dsc_bpp, enum msm_mode_dsc_cfg dsc_cfg, u8 tgt_bpp)
+ {
+ 	const u8 min_supported_bpp = MSM_DP_MIN_SUPPORTED_DSC_SRC_BPP;
+ 	struct msm_dp_display_mode_cfg cfg = {0};
+ 
+-	cfg.fec_available = fec_en;
+ 	cfg.tgt_bpp = tgt_bpp;
+ 
+ 	if (!dsc_bpp)
+@@ -369,25 +368,26 @@ static struct msm_dp_display_mode_cfg msm_dp_panel_get_supported_cfg(
+ {
+ 	u8 bpp = MSM_DP_DISPLAY_MODE_BPP_UNAVAILABLE;
+ 	u8 dsc_bpp = MSM_DP_DISPLAY_MODE_BPP_UNAVAILABLE;
+-	u32 data_rate_khz;
+-	bool fec_en;
+ 	u8 tgt_bpp = 0;
+ 	u32 mode_pclk_khz = msm_dp_mode->drm_mode.clock;
+ 
+-	fec_en = msm_dp_panel->fec_cap.supported;
+-	data_rate_khz = msm_dp_panel_calc_link_rate(msm_dp_panel, fec_en);
+-
+ 	if (dsc_cfg < MSM_MODE_DSC_REQUIRED)
+ 		bpp = msm_dp_panel_get_supported_bpp_no_dsc(
+-					mode_edid_bpp, mode_pclk_khz, data_rate_khz);
++					mode_edid_bpp,
++					mode_pclk_khz,
++					msm_dp_panel_calc_link_rate(msm_dp_panel, false));
+ 
+ 	if (dsc_cfg > MSM_MODE_DSC_UNAVAILABLE)
+ 		dsc_bpp = msm_dp_panel_get_supported_bpp_dsc(
+ 					msm_dp_panel,
+-					mode_edid_bpp, mode_pclk_khz, data_rate_khz, &tgt_bpp,
+-					msm_dp_mode, num_dsc);
+-
+-	return msm_dp_panel_get_cfg_from_bpp(bpp, dsc_bpp, dsc_cfg, fec_en, tgt_bpp);
++					mode_edid_bpp,
++					mode_pclk_khz,
++					msm_dp_panel_calc_link_rate(msm_dp_panel, true),
++					&tgt_bpp,
++					msm_dp_mode,
++					num_dsc);
++
++	return msm_dp_panel_get_cfg_from_bpp(bpp, dsc_bpp, dsc_cfg, tgt_bpp);
+ }
+ 
+ static void msm_dp_panel_read_sink_fec_caps(struct msm_dp_panel_private *panel)
+@@ -1341,7 +1341,7 @@ int msm_dp_panel_init_panel_info(struct msm_dp_panel *msm_dp_panel)
+ 				"dsc config failed\n");
+ 		return -EINVAL;
+ 	}
+-	msm_dp_panel->fec_cap.enabled = mode_cfg->fec_available;
++	msm_dp_panel->fec_cap.enabled = dsc_cfg == MSM_MODE_DSC_REQUIRED;
+ 	drm_dbg_dp(panel->drm_dev, "updated_bpp=%d fec=%d dsc=%d dsc_bpp=%d\n",
+ 				mode_cfg->bpp,
+ 				msm_dp_panel->fec_cap.enabled,
+@@ -1420,8 +1420,9 @@ void msm_dp_panel_config_dsc_dto(struct msm_dp_panel *msm_dp_panel, bool enable)
+ 		reg |= BIT(3);
+ 		reg |= (dto_n << 8);
+ 		reg |= (dto_d << 16);
++
++		msm_dp_write_p0(panel, MMSS_DP_DSC_DTO_COUNT, dto_count);
+ 	}
+-	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO_COUNT, dto_count);
+ 	msm_dp_write_p0(panel, MMSS_DP_DSC_DTO, reg);
+ }
+ 
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.h b/drivers/gpu/drm/msm/dp/dp_panel.h
+index 18d0dba8240b..8f2ea7b7bef4 100644
+--- a/drivers/gpu/drm/msm/dp/dp_panel.h
++++ b/drivers/gpu/drm/msm/dp/dp_panel.h
+@@ -22,7 +22,6 @@ struct edid;
+ struct msm_dp_display_mode_cfg {
+ 	u8 bpp;
+ 	u8 tgt_bpp;
+-	bool fec_available;
+ 	enum msm_mode_dsc_cfg dsc;
+ };
+ 
+-- 
+2.55.0
+

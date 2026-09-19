@@ -1,0 +1,35 @@
+From 04673c40c98621fcac66abbc30301d04492b6922 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Tue, 12 May 2026 17:35:25 -0300
+Subject: [PATCH 11/17] drm/msm/dpu: remove unused field from crtc
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h | 5 -----
+ 1 file changed, 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+index 6eaba5696e8e..baf41bfded47 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.h
+@@ -200,8 +200,6 @@ struct dpu_crtc {
+  * @new_perf: new performance state being requested
+  * @num_mixers    : Number of mixers in use
+  * @mixers        : List of active mixers
+- * @num_ctls      : Number of ctl paths in use
+- * @hw_ctls       : List of active ctl paths
+  * @crc_source    : CRC source
+  * @crc_frame_skip_count: Number of frames skipped before getting CRC
+  */
+@@ -220,9 +218,6 @@ struct dpu_crtc_state {
+ 	u32 num_mixers;
+ 	struct dpu_crtc_mixer mixers[CRTC_DUAL_MIXERS];
+ 
+-	u32 num_ctls;
+-	struct dpu_hw_ctl *hw_ctls[CRTC_DUAL_MIXERS];
+-
+ 	enum dpu_crtc_crc_source crc_source;
+ 	int crc_frame_skip_count;
+ };
+-- 
+2.55.0
+
