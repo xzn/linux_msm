@@ -1,0 +1,246 @@
+From 9afa70d77e78a56d219655bff2ea2adf27116244 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Thu, 22 Oct 2026 03:10:43 -0300
+Subject: [PATCH 611/611] phy: qcom: qmp-combo: reset mode when dp is powered
+ off
+
+---
+ drivers/gpu/drm/msm/dp/dp_ctrl.c          | 25 ++++-----
+ drivers/gpu/drm/msm/dp/dp_display.c       | 10 +++-
+ drivers/gpu/drm/msm/dp/dp_panel.c         |  1 +
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c | 65 +++++++++++++++--------
+ 4 files changed, 61 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 699a429165a2..a9c1192a699a 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -1638,10 +1638,8 @@ int msm_dp_ctrl_on_link(struct msm_dp_ctrl *msm_dp_ctrl)
+ 	struct msm_dp_ctrl_private *ctrl;
+ 	u32 rate;
+ 	int link_train_max_retries = 5;
+-	u32 const phy_cts_pixel_clk_khz = 148500;
+ 	u8 link_status[DP_LINK_STATUS_SIZE];
+ 	unsigned int training_step;
+-	unsigned long pixel_rate;
+ 
+ 	if (!msm_dp_ctrl)
+ 		return -EINVAL;
+@@ -1649,26 +1647,21 @@ int msm_dp_ctrl_on_link(struct msm_dp_ctrl *msm_dp_ctrl)
+ 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
+ 
+ 	rate = ctrl->panel->link_info.rate;
+-	pixel_rate = ctrl->panel->msm_dp_mode.drm_mode.clock;
+ 
+ 	msm_dp_ctrl_core_clk_enable(&ctrl->msm_dp_ctrl);
+ 
+ 	if (ctrl->link->sink_request & DP_TEST_LINK_PHY_TEST_PATTERN) {
+ 		drm_dbg_dp(ctrl->drm_dev,
+ 				"using phy test link parameters\n");
+-		if (!pixel_rate)
+-			pixel_rate = phy_cts_pixel_clk_khz;
+-	} else {
+-		ctrl->link->link_params.rate = rate;
+-		ctrl->link->link_params.num_lanes =
+-			ctrl->panel->link_info.num_lanes;
+-		if (ctrl->panel->msm_dp_mode.out_fmt_is_yuv_420)
+-			pixel_rate >>= 1;
+-	}
+-
+-	drm_dbg_dp(ctrl->drm_dev, "rate=%d, num_lanes=%d, pixel_rate=%lu\n",
+-		ctrl->link->link_params.rate, ctrl->link->link_params.num_lanes,
+-		pixel_rate);
++		ctrl->link->link_params = (struct msm_dp_link_info) {
++			.rate = 810000,
++			.num_lanes = 4,
++		};
++	} else
++		ctrl->link->link_params = ctrl->panel->link_info;
++
++	drm_dbg_dp(ctrl->drm_dev, "rate=%d, num_lanes=%d\n",
++		ctrl->link->link_params.rate, ctrl->link->link_params.num_lanes);
+ 
+ 	if (!ctrl->link_clks_on) { /* link clk is off */
+ 		rc = msm_dp_ctrl_enable_mainlink_clocks(ctrl);
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 28267a179944..e149190441de 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -399,8 +399,8 @@ static int msm_dp_display_handle_irq_hpd(struct msm_dp_display_private *dp)
+ 
+ static void msm_dp_display_pmic_glink_notify(struct msm_dp_display_private *dp)
+ {
+-	if (dp->pmic_glink)
+-		pmic_glink_mux_notify(dp->pmic_glink->supplier, dp->pmic_glink_port);
++	/* if (dp->pmic_glink)
++		pmic_glink_mux_notify(dp->pmic_glink->supplier, dp->pmic_glink_port); */
+ }
+ 
+ static int msm_dp_hpd_plug_handle_guarded(struct msm_dp_display_private *dp)
+@@ -775,6 +775,8 @@ enum drm_mode_status msm_dp_bridge_mode_valid(struct drm_bridge *bridge,
+ 
+ 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 
++	guard(mutex)(&msm_dp_display->plugged_lock);
++
+ 	is_yuv_420 = drm_mode_is_420_only(info, mode);
+ 
+ 	/*
+@@ -840,6 +842,8 @@ int msm_dp_bridge_get_modes(struct drm_bridge *bridge, struct drm_connector *con
+ 	msm_dp_display = to_dp_bridge(bridge)->msm_dp_display;
+ 	dp = container_of(msm_dp_display, struct msm_dp_display_private, msm_dp_display);
+ 
++	guard(mutex)(&dp->plugged_lock);
++
+ 	/* pluggable case assumes EDID is read when HPD */
+ 	if (dp->plugged == PLUGGED_STATE_LINK_READY) {
+ 		rc = msm_dp_display_get_modes(dp);
+@@ -1718,6 +1722,8 @@ void msm_dp_bridge_mode_set(struct drm_bridge *drm_bridge,
+ 	msm_dp_panel = msm_dp_display->panel;
+ 	msm_dp_mode = &msm_dp_display->panel->msm_dp_mode;
+ 
++	guard(mutex)(&msm_dp_display->plugged_lock);
++
+ 	memset(msm_dp_mode, 0x0, sizeof(struct msm_dp_display_mode));
+ 
+ 	if (msm_dp_display_check_video_test(dp))
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.c b/drivers/gpu/drm/msm/dp/dp_panel.c
+index 2124c1b326e4..20831c830e5c 100644
+--- a/drivers/gpu/drm/msm/dp/dp_panel.c
++++ b/drivers/gpu/drm/msm/dp/dp_panel.c
+@@ -115,6 +115,7 @@ static int msm_dp_panel_read_dpcd(struct msm_dp_panel *msm_dp_panel)
+ 
+ 	msm_dp_panel->vsc_sdp_supported = drm_dp_vsc_sdp_supported(panel->aux, dpcd);
+ 	link_info = &msm_dp_panel->link_info;
++	*link_info = (struct msm_dp_link_info) { 0 };
+ 	link_info->revision = dpcd[DP_DPCD_REV];
+ 	major = (link_info->revision >> 4) & 0x0f;
+ 	minor = link_info->revision & 0x0f;
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index 0f6b79c2500f..f59e9cf6f727 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -2295,6 +2295,7 @@ struct qmp_combo {
+ 	struct mutex phy_mutex;
+ 	int init_count;
+ 	enum qmpphy_mode qmpphy_mode;
++	bool qmpphy_mode_pending;
+ 
+ 	struct phy *usb_phy;
+ 	enum phy_mode phy_mode;
+@@ -3852,6 +3853,7 @@ static int qmp_combo_dp_power_on(struct phy *phy)
+ 	return 0;
+ }
+ 
++static void qmp_combo_reset_mode(struct qmp_combo *qmp);
+ static int qmp_combo_dp_power_off(struct phy *phy)
+ {
+ 	struct qmp_combo *qmp = phy_get_drvdata(phy);
+@@ -3863,6 +3865,11 @@ static int qmp_combo_dp_power_off(struct phy *phy)
+ 
+ 	qmp->dp_powered_on = false;
+ 
++	if (qmp->qmpphy_mode_pending) {
++		qmp_combo_reset_mode(qmp);
++		qmp->qmpphy_mode_pending = false;
++	}
++
+ 	mutex_unlock(&qmp->phy_mutex);
+ 
+ 	return 0;
+@@ -4445,7 +4452,9 @@ static int qmp_combo_typec_switch_set(struct typec_switch_dev *sw,
+ 	mutex_lock(&qmp->phy_mutex);
+ 	qmp->orientation = orientation;
+ 
+-	if (qmp->init_count) {
++	if (qmp->dp_powered_on) {
++		qmp->qmpphy_mode_pending = true;
++	} else if (qmp->init_count) {
+ 		if (qmp->usb_init_count)
+ 			qmp_combo_usb_power_off(qmp->usb_phy);
+ 		qmp_combo_com_exit(qmp, true);
+@@ -4461,6 +4470,32 @@ static int qmp_combo_typec_switch_set(struct typec_switch_dev *sw,
+ 	return 0;
+ }
+ 
++static void qmp_combo_reset_mode(struct qmp_combo *qmp)
++{
++	if (qmp->init_count) {
++		if (qmp->qmpphy_mode != QMPPHY_MODE_DP_ONLY)
++			if (qmp->usb_init_count)
++				qmp_combo_usb_power_off(qmp->usb_phy);
++
++		if (qmp->qmpphy_mode == QMPPHY_MODE_USB3_ONLY)
++			if (qmp->dp_init_count)
++				writel(DP_PHY_PD_CTL_PSR_PWRDN, qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL);
++
++		qmp_combo_com_exit(qmp, true);
++
++		/* Now everything's powered down, power up the right PHYs */
++		qmp_combo_com_init(qmp, true);
++
++		if (qmp->qmpphy_mode != QMPPHY_MODE_DP_ONLY)
++			if (qmp->usb_init_count)
++				qmp_combo_usb_power_on(qmp->usb_phy);
++
++		if (qmp->qmpphy_mode == QMPPHY_MODE_DP_ONLY || qmp->qmpphy_mode == QMPPHY_MODE_USB3DP)
++			if (qmp->dp_init_count)
++				qmp->cfg->dp_aux_init(qmp);
++	}
++}
++
+ static int qmp_combo_typec_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
+ {
+ 	struct qmp_combo *qmp = typec_mux_get_drvdata(mux);
+@@ -4506,7 +4541,9 @@ static int qmp_combo_typec_mux_set(struct typec_mux_dev *mux, struct typec_mux_s
+ 
+ 	if (qmp->qmpphy_mode != QMPPHY_MODE_USB3_ONLY && qmp->dp_powered_on) {
+ 		dev_dbg(qmp->dev, "typec_mux_set: DP PHY is still in use, delaying switch\n");
+-		return -EAGAIN;
++		qmp->qmpphy_mode = new_mode;
++		qmp->qmpphy_mode_pending = true;
++		return 0;
+ 	}
+ 
+ 	dev_dbg(qmp->dev, "typec_mux_set: switching from qmpphy mode %d to %d\n",
+@@ -4514,26 +4551,7 @@ static int qmp_combo_typec_mux_set(struct typec_mux_dev *mux, struct typec_mux_s
+ 
+ 	qmp->qmpphy_mode = new_mode;
+ 
+-	if (qmp->init_count) {
+-		if (new_mode != QMPPHY_MODE_DP_ONLY && qmp->usb_init_count)
+-			qmp_combo_usb_power_off(qmp->usb_phy);
+-
+-		if (qmp->dp_init_count && new_mode == QMPPHY_MODE_USB3_ONLY)
+-			writel(DP_PHY_PD_CTL_PSR_PWRDN, qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL);
+-
+-		qmp_combo_com_exit(qmp, true);
+-
+-		/* Now everything's powered down, power up the right PHYs */
+-		qmp_combo_com_init(qmp, true);
+-
+-		if (new_mode != QMPPHY_MODE_DP_ONLY && qmp->usb_init_count)
+-			qmp_combo_usb_power_on(qmp->usb_phy);
+-
+-		if (new_mode == QMPPHY_MODE_DP_ONLY || new_mode == QMPPHY_MODE_USB3DP) {
+-			if (qmp->dp_init_count)
+-				cfg->dp_aux_init(qmp);
+-		}
+-	}
++	qmp_combo_reset_mode(qmp);
+ 
+ 	return 0;
+ }
+@@ -4588,6 +4606,9 @@ static int qmp_combo_typec_register(struct qmp_combo *qmp)
+ {
+ 	return 0;
+ }
++static void qmp_combo_reset_mode(struct qmp_combo *qmp)
++{
++}
+ #endif
+ 
+ static int qmp_combo_parse_dt_legacy_dp(struct qmp_combo *qmp, struct device_node *np)
+-- 
+2.55.0
+
